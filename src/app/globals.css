@@ -1,0 +1,86 @@
+@import "tailwindcss";
+
+:root {
+  --background: #f4f5ef;
+  --foreground: #21303a;
+  --surface: #ffffff;
+  --surface-muted: #e8ebe3;
+  --surface-soft: #edf0e8;
+  --border-soft: #dce1d7;
+  --text-muted: #66727b;
+  --text-soft: #87919a;
+  --accent: #29af61;
+  --accent-strong: #1f8f4d;
+  --danger: #cb615f;
+  --warning: #b78633;
+  --shadow-soft: 0 20px 52px rgba(17, 24, 28, 0.08);
+  --shadow-card: 0 8px 20px rgba(17, 24, 28, 0.06);
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-surface: var(--surface);
+  --color-surface-muted: var(--surface-muted);
+  --color-surface-soft: var(--surface-soft);
+  --color-border-soft: var(--border-soft);
+  --color-text-muted: var(--text-muted);
+  --color-text-soft: var(--text-soft);
+  --color-accent: var(--accent);
+  --color-accent-strong: var(--accent-strong);
+  --color-danger: var(--danger);
+  --color-warning: var(--warning);
+  --font-sans: var(--font-plus-jakarta-sans);
+  --font-mono: var(--font-dm-mono);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  background: #eceee7;
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-plus-jakarta-sans), sans-serif;
+  min-height: 100vh;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+::selection {
+  background: rgba(49, 204, 116, 0.18);
+}
+
+.safe-pb {
+  padding-bottom: calc(env(safe-area-inset-bottom) + 1rem);
+}
+
+.safe-pt {
+  padding-top: calc(env(safe-area-inset-top) + 1rem);
+}
+
+.text-balance {
+  text-wrap: balance;
+}
+
+.device-shadow {
+  box-shadow: var(--shadow-soft);
+}
+
+.card-shadow {
+  box-shadow: var(--shadow-card);
+}
