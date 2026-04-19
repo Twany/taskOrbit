@@ -2,6 +2,7 @@ export type ProjectStatus = "active" | "paused";
 export type TaskPriority = "low" | "medium" | "high";
 export type TaskState = "active" | "done";
 export type TaskBucket = "overdue" | "today" | "tomorrow" | "backlog" | "done";
+export type RepeatType = "none" | "daily" | "weekdays";
 export type AppScreen = "tasks" | "projects" | "review" | "settings";
 export type TaskFilter = "all" | "my-day" | "my-week";
 export type DataSource = "demo" | "supabase";
@@ -25,12 +26,16 @@ export interface Project {
 export interface Task {
   id: string;
   projectId: string;
+  templateId: string | null;
   title: string;
   note?: string;
   state: TaskState;
   plannedDate: string | null;
+  taskDate: string | null;
   completedAt: string | null;
   priority: TaskPriority;
+  repeatType: RepeatType | null;
+  isSkipped: boolean;
   createdAt: string;
 }
 
@@ -39,5 +44,6 @@ export interface DashboardData {
   source: DataSource;
   projects: Project[];
   tasks: Task[];
+  syncIssue?: "load-failed" | null;
   generatedAt: string;
 }

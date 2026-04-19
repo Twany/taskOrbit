@@ -1,19 +1,7 @@
 import type { Metadata, Viewport } from "next";
-import { DM_Mono, Plus_Jakarta_Sans } from "next/font/google";
 import { getDictionary } from "@/lib/locale";
 import { getRequestLocale } from "@/lib/locale.server";
 import "./globals.css";
-
-const plusJakartaSans = Plus_Jakarta_Sans({
-  variable: "--font-plus-jakarta-sans",
-  subsets: ["latin"],
-});
-
-const dmMono = DM_Mono({
-  variable: "--font-dm-mono",
-  weight: ["400", "500"],
-  subsets: ["latin"],
-});
 
 export async function generateMetadata(): Promise<Metadata> {
   const locale = await getRequestLocale();
@@ -62,7 +50,7 @@ export default async function RootLayout({
   return (
     <html
       lang={locale === "zh" ? "zh-CN" : "en"}
-      className={`${plusJakartaSans.variable} ${dmMono.variable} h-full antialiased`}
+      className="h-full antialiased"
     >
       <body className="min-h-full flex flex-col">{children}</body>
     </html>

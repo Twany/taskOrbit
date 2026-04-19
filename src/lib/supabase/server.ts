@@ -7,9 +7,12 @@ import { getSupabaseEnv } from "./env";
 
 export async function createSupabaseServerClient() {
   const cookieStore = await cookies();
-  const { url, anonKey } = getSupabaseEnv();
+  const { url, anonKey, dbSchema } = getSupabaseEnv();
 
   return createServerClient(url, anonKey, {
+    db: {
+      schema: dbSchema,
+    },
     cookies: {
       getAll() {
         return cookieStore.getAll();

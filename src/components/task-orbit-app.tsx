@@ -1,11 +1,12 @@
 "use client";
 
 import {
-	startTransition,
+	useCallback,
 	useDeferredValue,
 	useEffect,
 	useEffectEvent,
 	useMemo,
+	useRef,
 	useState,
 } from "react";
 import {addDays, format} from "date-fns";
@@ -21,10 +22,10 @@ import {
 	Layers3,
 	Leaf,
 	Orbit,
+	Pencil,
 	Plus,
 	Settings,
 	Sparkles,
-	UserRound,
 } from "lucide-react";
 
 import {
@@ -45,6 +46,7 @@ import type {
 	AppScreen,
 	DashboardData,
 	Project,
+	RepeatType,
 	Task,
 	TaskBucket,
 	TaskPriority,
@@ -56,10 +58,12 @@ type ComposerState = {
 	projectId: string;
 	bucket: Extract<TaskBucket, "backlog" | "today" | "tomorrow">;
 	priority: TaskPriority;
+	repeatType: RepeatType;
 };
 
 type TaskMutationPayload = {
-	bucket: Extract<TaskBucket, "backlog" | "today" | "tomorrow" | "done">;
+	bucket?: Extract<TaskBucket, "backlog" | "today" | "tomorrow" | "done">;
+	action?: "skip-today" | "pause-repeat";
 };
 
 const PROJECT_ALL_ID = "all-projects";
@@ -137,6 +141,8 @@ type ProjectEditorState = {
 	status: Project["status"];
 };
 
+const CREATE_PROJECT_OPTION = "__create-project__";
+
 function createProjectEditor(project?: Project): ProjectEditorState {
 	return {
 		id: project?.id ?? null,
@@ -162,7 +168,7 @@ function projectIcon(icon: Project["icon"], className?: string) {
 	}
 }
 
-function buildTaskPatch(bucket: TaskMutationPayload["bucket"]) {
+function buildTaskPatch(bucket: NonNullable<TaskMutationPayload["bucket"]>) {
 	const today = new Date();
 	const nextDay = addDays(today, 1);
 
@@ -228,6 +234,33 @@ function formatTaskMeta(task: Task, locale: AppLocale) {
 	return formatLocaleDate(task.plannedDate, locale);
 }
 
+async function readMutationError(response: Response, fallback: string) {
+	const payload = (await response.json().catch(() => null)) as
+		| {error?: string}
+		| null;
+
+	throw new Error(payload?.error ?? fallback);
+}
+
+function resolveMutationMessage(
+	error: unknown,
+	authMessage: string,
+	fallbackMessage: string,
+) {
+	const message =
+		error instanceof Error ? error.message.toLowerCase() : "";
+
+	if (
+		message.includes("unauthorized") ||
+		message.includes("auth.uid") ||
+		message.includes("jwt")
+	) {
+		return authMessage;
+	}
+
+	return fallbackMessage;
+}
+
 export function TaskOrbitApp({
 	initialData,
 	initialLocale,
@@ -246,15 +279,28 @@ export function TaskOrbitApp({
 	const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
 	const [composerOpen, setComposerOpen] = useState(false);
 	const [projectSheetOpen, setProjectSheetOpen] = useState(false);
-	const [statusMessage, setStatusMessage] = useState<string | null>(null);
+	const [resumeComposerAfterProjectSheet, setResumeComposerAfterProjectSheet] =
+		useState(false);
+	const [statusMessage, setStatusMessage] = useState<string | null>(
+		initialData.syncIssue === "load-failed"
+			? getDictionary(initialLocale).syncLoadFailed
+			: null,
+	);
 	const [showReminder, setShowReminder] = useState(
 		readStoredPreferences().openReminderEnabled,
 	);
+	const [isTaskSaving, setIsTaskSaving] = useState(false);
+	const [movingTaskId, setMovingTaskId] = useState<string | null>(null);
+	const [isProjectSaving, setIsProjectSaving] = useState(false);
+	const [isProjectDeleting, setIsProjectDeleting] = useState(false);
+	const [isLocaleSaving, setIsLocaleSaving] = useState(false);
+	const [isAuthRouting, setIsAuthRouting] = useState(false);
 	const [composer, setComposer] = useState<ComposerState>({
 		title: "",
 		projectId: initialData.projects[0]?.id ?? "",
 		bucket: "backlog",
 		priority: "medium",
+		repeatType: "none",
 	});
 	const [projectEditor, setProjectEditor] = useState<ProjectEditorState>(
 		createProjectEditor(),
@@ -316,18 +362,37 @@ export function TaskOrbitApp({
 		);
 	}, [preferences]);
 
+	useEffect(() => {
+		if (!statusMessage) {
+			return;
+		}
+
+		const timer = window.setTimeout(() => {
+			setStatusMessage(null);
+		}, 3200);
+
+		return () => {
+			window.clearTimeout(timer);
+		};
+	}, [statusMessage]);
+
 	const canSyncToCloud =
-		initialData.source === "supabase" && initialData.viewer.isAuthenticated;
+		initialData.viewer.cloudSyncConfigured && initialData.viewer.isAuthenticated;
 
 	async function handleLocaleChange(nextLocale: AppLocale) {
 		setLocale(nextLocale);
-		void fetch("/api/locale", {
-			method: "POST",
-			headers: {
-				"Content-Type": "application/json",
-			},
-			body: JSON.stringify({ locale: nextLocale }),
-		});
+		setIsLocaleSaving(true);
+		try {
+			await fetch("/api/locale", {
+				method: "POST",
+				headers: {
+					"Content-Type": "application/json",
+				},
+				body: JSON.stringify({locale: nextLocale}),
+			});
+		} finally {
+			setIsLocaleSaving(false);
+		}
 	}
 
 	function getPreferredProjectId(fallbackProjectId?: string) {
@@ -356,6 +421,7 @@ export function TaskOrbitApp({
 			projectId: getPreferredProjectId(composer.projectId),
 			bucket,
 			priority: "medium",
+			repeatType: "none",
 		});
 		setComposerOpen(true);
 	}
@@ -373,7 +439,7 @@ export function TaskOrbitApp({
 		});
 
 		if (!response.ok) {
-			throw new Error("Unable to update task");
+			await readMutationError(response, "Unable to update task");
 		}
 
 		const data = (await response.json()) as {task: Task};
@@ -390,7 +456,7 @@ export function TaskOrbitApp({
 		});
 
 		if (!response.ok) {
-			throw new Error("Unable to create task");
+			await readMutationError(response, "Unable to create task");
 		}
 
 		const data = (await response.json()) as {task: Task};
@@ -407,7 +473,7 @@ export function TaskOrbitApp({
 		});
 
 		if (!response.ok) {
-			throw new Error("Unable to create project");
+			await readMutationError(response, "Unable to create project");
 		}
 
 		const data = (await response.json()) as {project: Project};
@@ -427,7 +493,7 @@ export function TaskOrbitApp({
 		});
 
 		if (!response.ok) {
-			throw new Error("Unable to update project");
+			await readMutationError(response, "Unable to update project");
 		}
 
 		const data = (await response.json()) as {project: Project};
@@ -440,46 +506,91 @@ export function TaskOrbitApp({
 		});
 
 		if (!response.ok) {
-			throw new Error("Unable to delete project");
+			await readMutationError(response, "Unable to delete project");
 		}
 	}
 
-	function handleTaskMove(
+	async function handleTaskMove(
 		taskId: string,
-		bucket: TaskMutationPayload["bucket"],
+		bucket: NonNullable<TaskMutationPayload["bucket"]>,
 	) {
 		const previousTasks = tasks;
 		const patch = buildTaskPatch(bucket);
 
 		setStatusMessage(null);
-		startTransition(async () => {
+		setMovingTaskId(taskId);
+		setTasks((current) =>
+			current.map((task) => (task.id === taskId ? {...task, ...patch} : task)),
+		);
+
+		if (!canSyncToCloud) {
+			setMovingTaskId(null);
+			return;
+		}
+
+		try {
+			const syncedTask = await persistTaskUpdate(taskId, {bucket});
 			setTasks((current) =>
-				current.map((task) =>
-					task.id === taskId ? {...task, ...patch} : task,
-				),
+				current.map((task) => (task.id === taskId ? syncedTask : task)),
 			);
-
-			if (!canSyncToCloud) {
-				return;
-			}
-
-			try {
-				const syncedTask = await persistTaskUpdate(taskId, {bucket});
-				setTasks((current) =>
-					current.map((task) =>
-						task.id === taskId ? syncedTask : task,
-					),
-				);
-			} catch {
-				setTasks(previousTasks);
-				setStatusMessage(
-					t.cloudSyncFailed,
-				);
-			}
-		});
+		} catch (error) {
+			setTasks(previousTasks);
+			setStatusMessage(
+				resolveMutationMessage(error, t.taskCreateAuth, t.taskMoveFailed),
+			);
+		} finally {
+			setMovingTaskId(null);
+		}
 	}
 
-	function handleTaskCreate() {
+	async function handleRecurringTaskAction(
+		taskId: string,
+		action: "skip-today" | "pause-repeat",
+	) {
+		const previousTasks = tasks;
+
+		setStatusMessage(null);
+		setMovingTaskId(taskId);
+
+		if (action === "skip-today") {
+			setTasks((current) => current.filter((task) => task.id !== taskId));
+		} else {
+			setTasks((current) =>
+				current.map((task) =>
+					task.id === taskId ? {...task, repeatType: null, templateId: null} : task,
+				),
+			);
+		}
+
+		if (!canSyncToCloud) {
+			setMovingTaskId(null);
+			return;
+		}
+
+		try {
+			const syncedTask = await persistTaskUpdate(taskId, {action});
+			if (action === "skip-today") {
+				setTasks((current) => current.filter((task) => task.id !== taskId));
+			} else {
+				setTasks((current) =>
+					current.map((task) => (task.id === taskId ? syncedTask : task)),
+				);
+			}
+		} catch (error) {
+			setTasks(previousTasks);
+			setStatusMessage(
+				resolveMutationMessage(
+					error,
+					t.taskCreateAuth,
+					action === "skip-today" ? t.taskSkipFailed : t.taskPauseFailed,
+				),
+			);
+		} finally {
+			setMovingTaskId(null);
+		}
+	}
+
+	async function handleTaskCreate() {
 		if (!composer.title.trim() || !composer.projectId) {
 			return;
 		}
@@ -487,58 +598,98 @@ export function TaskOrbitApp({
 		const optimisticTask: Task = {
 			id: `local-${crypto.randomUUID()}`,
 			projectId: composer.projectId,
+			templateId:
+				composer.repeatType === "none"
+					? null
+					: `local-template-${crypto.randomUUID()}`,
 			title: composer.title.trim(),
 			note: "",
 			priority: composer.priority,
+			taskDate:
+				composer.repeatType === "none"
+					? buildTaskPatch(composer.bucket).plannedDate
+					: format(new Date(), "yyyy-MM-dd"),
+			repeatType:
+				composer.repeatType === "none" ? null : composer.repeatType,
+			isSkipped: false,
 			createdAt: new Date().toISOString(),
-			...buildTaskPatch(composer.bucket),
+			...buildTaskPatch(
+				composer.repeatType === "none" ? composer.bucket : "today",
+			),
 		};
 
 		setStatusMessage(null);
 		setComposerOpen(false);
-
-		startTransition(async () => {
-			setTasks((current) => [optimisticTask, ...current]);
-			setComposer({
-				title: "",
-				projectId: getPreferredProjectId(composer.projectId),
-				bucket: preferences.defaultTaskBucket,
-				priority: "medium",
-			});
-
-			if (!canSyncToCloud) {
-				return;
-			}
-
-			try {
-				const syncedTask = await persistTaskCreate(composer);
-				setTasks((current) =>
-					current.map((task) =>
-						task.id === optimisticTask.id ? syncedTask : task,
-					),
-				);
-			} catch {
-				setTasks((current) =>
-					current.filter((task) => task.id !== optimisticTask.id),
-				);
-				setStatusMessage(
-					t.taskCreateFailed,
-				);
-			}
+		setIsTaskSaving(true);
+		setTasks((current) => [optimisticTask, ...current]);
+		setComposer({
+			title: "",
+			projectId: getPreferredProjectId(composer.projectId),
+			bucket: preferences.defaultTaskBucket,
+			priority: "medium",
+			repeatType: "none",
 		});
+
+		if (!canSyncToCloud) {
+			setIsTaskSaving(false);
+			return;
+		}
+
+		try {
+			const syncedTask = await persistTaskCreate(composer);
+			setTasks((current) =>
+				current.map((task) =>
+					task.id === optimisticTask.id ? syncedTask : task,
+				),
+			);
+		} catch (error) {
+			setTasks((current) =>
+				current.filter((task) => task.id !== optimisticTask.id),
+			);
+			setStatusMessage(
+				resolveMutationMessage(error, t.taskCreateAuth, t.taskCreateFailed),
+			);
+		} finally {
+			setIsTaskSaving(false);
+		}
 	}
 
 	function openCreateProject() {
 		setProjectEditor(createProjectEditor());
+		setResumeComposerAfterProjectSheet(false);
 		setProjectSheetOpen(true);
 	}
 
 	function openEditProject(project: Project) {
 		setProjectEditor(createProjectEditor(project));
+		setResumeComposerAfterProjectSheet(false);
 		setProjectSheetOpen(true);
 	}
 
-	function handleProjectSave() {
+	function openInlineProjectCreate() {
+		setProjectEditor(createProjectEditor());
+		setResumeComposerAfterProjectSheet(true);
+		setComposerOpen(false);
+		setProjectSheetOpen(true);
+	}
+
+	function closeProjectSheet() {
+		setProjectSheetOpen(false);
+
+		if (resumeComposerAfterProjectSheet) {
+			setComposerOpen(true);
+			setResumeComposerAfterProjectSheet(false);
+		}
+	}
+
+	function handleAuthRoute() {
+		setIsAuthRouting(true);
+		window.location.assign(
+			initialData.viewer.isAuthenticated ? "/auth/sign-out" : "/login",
+		);
+	}
+
+	async function handleProjectSave() {
 		const name = projectEditor.name.trim();
 
 		if (!name) {
@@ -547,8 +698,10 @@ export function TaskOrbitApp({
 		}
 
 		const previousProjects = projects;
+		const previousActiveProjectId = activeProjectId;
 		setStatusMessage(null);
 		setProjectSheetOpen(false);
+		setIsProjectSaving(true);
 
 		if (projectEditor.id) {
 			const projectId = projectEditor.id;
@@ -563,41 +716,39 @@ export function TaskOrbitApp({
 						?.sortOrder ?? 0,
 			};
 
-			startTransition(async () => {
+			setProjects((current) =>
+				current.map((project) =>
+					project.id === optimisticProject.id ? optimisticProject : project,
+				),
+			);
+
+			if (!canSyncToCloud) {
+				setIsProjectSaving(false);
+				return;
+			}
+
+			try {
+				const syncedProject = await persistProjectUpdate(projectId, {
+					...projectEditor,
+					name,
+				});
 				setProjects((current) =>
 					current.map((project) =>
-						project.id === optimisticProject.id
-							? optimisticProject
-							: project,
+						project.id === syncedProject.id ? syncedProject : project,
 					),
 				);
-
-				if (!canSyncToCloud) {
-					return;
-				}
-
-				try {
-					const syncedProject = await persistProjectUpdate(
-						projectId,
-						{
-							...projectEditor,
-							name,
-						},
-					);
-					setProjects((current) =>
-						current.map((project) =>
-							project.id === syncedProject.id
-								? syncedProject
-								: project,
-						),
-					);
-				} catch {
-					setProjects(previousProjects);
-					setStatusMessage(
+			} catch (error) {
+				setProjects(previousProjects);
+				setStatusMessage(
+					resolveMutationMessage(
+						error,
+						t.projectCreateAuth,
 						t.projectUpdateFailed,
-					);
-				}
-			});
+					),
+				);
+			} finally {
+				setIsProjectSaving(false);
+			}
 
 			return;
 		}
@@ -611,38 +762,58 @@ export function TaskOrbitApp({
 			sortOrder: projects.length,
 		};
 
-		startTransition(async () => {
-			setProjects((current) => [...current, optimisticProject]);
-			setActiveProjectId(optimisticProject.id);
+		setProjects((current) => [...current, optimisticProject]);
+		setActiveProjectId(optimisticProject.id);
+		if (resumeComposerAfterProjectSheet) {
+			setComposer((current) => ({
+				...current,
+				projectId: optimisticProject.id,
+			}));
+			setComposerOpen(true);
+			setResumeComposerAfterProjectSheet(false);
+		}
 
-			if (!canSyncToCloud) {
-				return;
+		if (!canSyncToCloud) {
+			setIsProjectSaving(false);
+			return;
+		}
+
+		try {
+			const syncedProject = await persistProjectCreate({
+				...projectEditor,
+				name,
+			});
+			setProjects((current) =>
+				current.map((project) =>
+					project.id === optimisticProject.id ? syncedProject : project,
+				),
+			);
+			setActiveProjectId(syncedProject.id);
+			setComposer((current) =>
+				current.projectId === optimisticProject.id
+					? {...current, projectId: syncedProject.id}
+					: current,
+			);
+		} catch (error) {
+			setProjects(previousProjects);
+			setActiveProjectId(previousActiveProjectId);
+			if (resumeComposerAfterProjectSheet) {
+				setComposerOpen(true);
+				setResumeComposerAfterProjectSheet(false);
 			}
-
-			try {
-				const syncedProject = await persistProjectCreate({
-					...projectEditor,
-					name,
-				});
-				setProjects((current) =>
-					current.map((project) =>
-						project.id === optimisticProject.id
-							? syncedProject
-							: project,
-					),
-				);
-				setActiveProjectId(syncedProject.id);
-			} catch {
-				setProjects(previousProjects);
-				setActiveProjectId(PROJECT_ALL_ID);
-				setStatusMessage(
+			setStatusMessage(
+				resolveMutationMessage(
+					error,
+					t.projectCreateAuth,
 					t.projectCreateFailed,
-				);
-			}
-		});
+				),
+			);
+		} finally {
+			setIsProjectSaving(false);
+		}
 	}
 
-	function handleProjectDelete() {
+	async function handleProjectDelete() {
 		if (!projectEditor.id) {
 			return;
 		}
@@ -656,88 +827,68 @@ export function TaskOrbitApp({
 
 		const previousProjects = projects;
 		const previousTasks = tasks;
+		const previousActiveProjectId = activeProjectId;
 		setStatusMessage(null);
 		setProjectSheetOpen(false);
+		setIsProjectDeleting(true);
+		setProjects((current) =>
+			current.filter((project) => project.id !== deletingProjectId),
+		);
+		setTasks((current) =>
+			current.filter((task) => task.projectId !== deletingProjectId),
+		);
+		setSelectedTaskId(null);
+		setComposer((current) => {
+			if (current.projectId !== deletingProjectId) {
+				return current;
+			}
 
-		startTransition(async () => {
-			setProjects((current) =>
-				current.filter((project) => project.id !== deletingProjectId),
+			const fallbackProject = projects.find(
+				(project) => project.id !== deletingProjectId,
 			);
-			setTasks((current) =>
-				current.filter((task) => task.projectId !== deletingProjectId),
-			);
-			setSelectedTaskId(null);
-			setComposer((current) => {
-				if (current.projectId !== deletingProjectId) {
-					return current;
-				}
 
-				const fallbackProject = projects.find(
-					(project) => project.id !== deletingProjectId,
-				);
-
-				return {
-					...current,
-					projectId: fallbackProject?.id ?? "",
-				};
-			});
-
-			if (activeProjectId === deletingProjectId) {
-				setActiveProjectId(PROJECT_ALL_ID);
-			}
-
-			if (!canSyncToCloud) {
-				return;
-			}
-
-			try {
-				await persistProjectDelete(deletingProjectId);
-			} catch {
-				setProjects(previousProjects);
-				setTasks(previousTasks);
-				setStatusMessage(
-					t.projectDeleteFailed,
-				);
-			}
+			return {
+				...current,
+				projectId: fallbackProject?.id ?? "",
+			};
 		});
+
+		if (activeProjectId === deletingProjectId) {
+			setActiveProjectId(PROJECT_ALL_ID);
+		}
+
+		if (!canSyncToCloud) {
+			setIsProjectDeleting(false);
+			return;
+		}
+
+		try {
+			await persistProjectDelete(deletingProjectId);
+		} catch {
+			setProjects(previousProjects);
+			setTasks(previousTasks);
+			setActiveProjectId(previousActiveProjectId);
+			setStatusMessage(t.projectDeleteFailed);
+		} finally {
+			setIsProjectDeleting(false);
+		}
 	}
 
 	return (
-		<main className="flex min-h-screen items-start justify-center px-0 py-0 sm:px-6 sm:py-10">
-			<div className="device-shadow flex min-h-screen w-full max-w-[430px] flex-col overflow-hidden bg-background sm:min-h-[880px] sm:rounded-[2.15rem]">
+		<main className="flex h-[100dvh] overflow-hidden items-start justify-center px-0 py-0 sm:min-h-screen sm:px-6 sm:py-10">
+			<div className="device-shadow relative flex h-[100dvh] w-full max-w-[430px] flex-col overflow-hidden bg-background sm:h-[880px] sm:rounded-[2.15rem]">
+				{statusMessage ? (
+					<div className="pointer-events-none absolute inset-x-5 bottom-[calc(env(safe-area-inset-bottom)+5.5rem)] z-30 flex justify-center">
+						<div className="rounded-[1rem] bg-[rgba(33,48,58,0.92)] px-4 py-3 text-sm font-medium text-white shadow-[0_10px_30px_rgba(17,24,28,0.18)] backdrop-blur-sm">
+							{statusMessage}
+						</div>
+					</div>
+				) : null}
 				{isHomeScreen ? (
 					<header className="safe-pt bg-background px-5 pb-3">
-						<div className="mb-2 flex items-center justify-between text-foreground">
-							<span className="font-mono text-base font-medium tracking-tight">
-								{format(new Date(), "HH:mm")}
-							</span>
-							<div className="flex items-center gap-2">
-								<span
-									className={cn(
-										"h-2 w-2 rounded-full",
-										initialData.source === "supabase" &&
-											initialData.viewer.isAuthenticated
-											? "bg-accent"
-											: "bg-text-soft",
-									)}
-								/>
-								<span className="text-[11px] font-semibold uppercase tracking-[0.16em] text-text-muted">
-									{initialData.source === "supabase" &&
-									initialData.viewer.isAuthenticated
-										? t.cloud
-										: t.demo}
-								</span>
-							</div>
-						</div>
-
-						<div className="flex items-center justify-between gap-3">
-							<p className="text-base font-semibold text-foreground">
-								{selectedProject?.name ?? t.all}
-							</p>
-							<div className="flex h-8 w-8 items-center justify-center rounded-[0.9rem] bg-surface-muted text-text-muted">
-								<UserRound className="h-4 w-4" />
-							</div>
-						</div>
+						<p className="text-base font-semibold text-foreground">
+							{selectedProject?.name ?? t.all}
+						</p>
 
 						<div className="mt-3 flex gap-2 overflow-x-auto pb-1 [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden">
 							<ProjectChip
@@ -765,7 +916,7 @@ export function TaskOrbitApp({
 
 						{showReminder && todayOpenCount > 0 ? (
 							<button
-								className="mt-3 flex w-full items-center justify-between rounded-2xl bg-[#edf8f1] px-4 py-3 text-left"
+								className="pressable mt-3 flex w-full items-center justify-between rounded-2xl bg-[#edf8f1] px-4 py-3 text-left"
 								onClick={() => setShowReminder(false)}
 								type="button"
 							>
@@ -785,21 +936,17 @@ export function TaskOrbitApp({
 
 				<section
 					className={cn(
-						"flex-1 overflow-y-auto bg-background px-5 pb-32",
+						"min-h-0 flex-1 overflow-y-auto bg-background px-5",
 						isHomeScreen ? "pt-5" : "safe-pt pt-4",
 					)}
+					style={{ overscrollBehaviorY: "contain" }}
 				>
-					{statusMessage ? (
-						<div className="mb-4 rounded-2xl bg-[#fff5f5] px-4 py-3 text-sm text-[#b95c59]">
-							{statusMessage}
-						</div>
-					) : null}
-
 					{activeScreen === "tasks" ? (
 						<TasksScreen
-							groupedAllTasks={groupedAllTasks}
 							groupedTasks={groupedTasks}
 							locale={locale}
+							movingTaskId={movingTaskId}
+							onRecurringAction={handleRecurringTaskAction}
 							onQuickAdd={(bucket) =>
 								openTaskComposer(
 									bucket === "today" ||
@@ -847,6 +994,9 @@ export function TaskOrbitApp({
 
 					{activeScreen === "settings" ? (
 						<SettingsScreen
+							isAuthRouting={isAuthRouting}
+							isLocaleSaving={isLocaleSaving}
+							onAuthRoute={handleAuthRoute}
 							locale={locale}
 							onDefaultBucketChange={(defaultTaskBucket) =>
 								setPreferences((current) => ({
@@ -882,7 +1032,7 @@ export function TaskOrbitApp({
 					) : null}
 				</section>
 
-				<nav className="safe-pb fixed inset-x-0 bottom-0 mx-auto flex w-full max-w-[430px] items-end justify-between bg-[rgba(255,255,255,0.94)] px-5 pb-3 pt-2 backdrop-blur-md sm:rounded-b-[2.15rem]">
+				<nav className="safe-pb relative z-10 flex items-end justify-between bg-[rgba(255,255,255,0.94)] px-5 pb-3 pt-2 backdrop-blur-md sm:rounded-b-[2.15rem]">
 					<NavButton
 						active={activeScreen === "tasks"}
 						icon={<CheckCircle2 className="h-5 w-5" />}
@@ -894,7 +1044,8 @@ export function TaskOrbitApp({
 						onClick={() => setActiveScreen("projects")}
 					/>
 					<button
-						className="card-shadow -mt-7 flex h-[3.35rem] w-[3.35rem] items-center justify-center rounded-[1.15rem] bg-accent text-white"
+						className="pressable card-shadow -mt-7 flex h-[3.35rem] w-[3.35rem] items-center justify-center rounded-[1.15rem] bg-accent text-white disabled:pointer-events-none disabled:opacity-60"
+						disabled={isTaskSaving || isProjectSaving}
 						onClick={() => openTaskComposer()}
 						type="button"
 					>
@@ -913,8 +1064,14 @@ export function TaskOrbitApp({
 				</nav>
 
 				{composerOpen ? (
-					<div className="fixed inset-0 z-20 flex items-end justify-center bg-[rgba(28,40,54,0.28)] px-4 pb-0 pt-10">
-						<div className="w-full max-w-[430px] rounded-t-[2rem] bg-surface px-5 pb-8 pt-5">
+					<div
+						className="fixed inset-0 z-20 flex items-end justify-center bg-[rgba(28,40,54,0.28)] px-4 pb-0 pt-10"
+						onClick={() => setComposerOpen(false)}
+					>
+						<div
+							className="w-full max-w-[430px] rounded-t-[2rem] bg-surface px-5 pb-8 pt-5"
+							onClick={(event) => event.stopPropagation()}
+						>
 							<div className="mx-auto h-1.5 w-14 rounded-full bg-border-soft" />
 							<div className="mt-5 flex items-center justify-between">
 								<div>
@@ -926,7 +1083,8 @@ export function TaskOrbitApp({
 									</h2>
 								</div>
 								<button
-									className="rounded-xl bg-surface-soft px-3 py-2 text-sm font-semibold text-text-muted"
+									className="pressable rounded-xl bg-surface-soft px-3 py-2 text-sm font-semibold text-text-muted disabled:pointer-events-none disabled:opacity-60"
+									disabled={isTaskSaving}
 									onClick={() => setComposerOpen(false)}
 									type="button"
 								>
@@ -934,7 +1092,10 @@ export function TaskOrbitApp({
 								</button>
 							</div>
 
-							<div className="mt-5 space-y-4">
+							<fieldset
+								className={cn("mt-5 space-y-4", isTaskSaving && "opacity-70")}
+								disabled={isTaskSaving}
+							>
 								<label className="block">
 									<span className="mb-2 block text-sm font-semibold text-foreground">
 										{t.name}
@@ -947,9 +1108,7 @@ export function TaskOrbitApp({
 												title: event.target.value,
 											}))
 										}
-										placeholder={
-											t.taskPlaceholder
-										}
+										placeholder={t.taskPlaceholder}
 										value={composer.title}
 									/>
 								</label>
@@ -959,15 +1118,23 @@ export function TaskOrbitApp({
 										<span className="mb-2 block text-sm font-semibold text-foreground">
 											{t.project}
 										</span>
-										<select
+									<select
 											className="w-full rounded-[1rem] bg-surface-soft px-4 py-4 text-sm text-foreground outline-none"
-											onChange={(event) =>
+											onChange={(event) => {
+												if (
+													event.target.value ===
+													CREATE_PROJECT_OPTION
+												) {
+													openInlineProjectCreate();
+													return;
+												}
+
 												setComposer((current) => ({
 													...current,
 													projectId:
 														event.target.value,
-												}))
-											}
+												}));
+											}}
 											value={composer.projectId}
 										>
 											{projects.map((project) => (
@@ -978,6 +1145,9 @@ export function TaskOrbitApp({
 													{project.name}
 												</option>
 											))}
+											<option value={CREATE_PROJECT_OPTION}>
+												+ {t.new}
+											</option>
 										</select>
 									</label>
 
@@ -986,7 +1156,8 @@ export function TaskOrbitApp({
 											{t.list}
 										</span>
 										<select
-											className="w-full rounded-[1rem] bg-surface-soft px-4 py-4 text-sm text-foreground outline-none"
+											className="w-full rounded-[1rem] bg-surface-soft px-4 py-4 text-sm text-foreground outline-none disabled:opacity-60"
+											disabled={composer.repeatType !== "none"}
 											onChange={(event) =>
 												setComposer((current) => ({
 													...current,
@@ -999,7 +1170,9 @@ export function TaskOrbitApp({
 											<option value="backlog">
 												{t.backlog}
 											</option>
-											<option value="today">{t.today}</option>
+											<option value="today">
+												{t.today}
+											</option>
 											<option value="tomorrow">
 												{t.tomorrow}
 											</option>
@@ -1009,43 +1182,84 @@ export function TaskOrbitApp({
 
 								<label className="block">
 									<span className="mb-2 block text-sm font-semibold text-foreground">
-										{t.priority}
+										{t.repeat}
 									</span>
-									<div className="rounded-[1rem] bg-surface-soft p-1">
-										{priorityOptions.map(([priority, label]) => (
+									<div className="grid grid-cols-3 rounded-[0.9rem] bg-surface-soft p-0.5">
+										{([
+											["none", t.none],
+											["daily", t.daily],
+											["weekdays", t.weekdays],
+										] as const).map(([repeatType, label]) => (
 											<SegmentButton
-												key={priority}
-												active={
-													composer.priority ===
-													priority
-												}
+												key={repeatType}
+												active={composer.repeatType === repeatType}
 												label={label}
 												onClick={() =>
 													setComposer((current) => ({
 														...current,
-														priority,
+														repeatType,
+														bucket:
+															repeatType === "none"
+																? current.bucket
+																: "today",
 													}))
 												}
 											/>
 										))}
 									</div>
 								</label>
-							</div>
+
+								<label className="block">
+									<span className="mb-2 block text-sm font-semibold text-foreground">
+										{t.priority}
+									</span>
+									<div className="grid grid-cols-3 rounded-[0.9rem] bg-surface-soft p-0.5">
+										{priorityOptions.map(
+											([priority, label]) => (
+												<SegmentButton
+													key={priority}
+													active={
+														composer.priority ===
+														priority
+													}
+													label={label}
+													onClick={() =>
+														setComposer(
+															(current) => ({
+																...current,
+																priority,
+															}),
+														)
+													}
+												/>
+											),
+										)}
+									</div>
+								</label>
+							</fieldset>
 
 							<button
-								className="mt-6 flex w-full items-center justify-center rounded-[1rem] bg-accent px-4 py-4 text-base font-semibold text-white"
+								aria-busy={isTaskSaving}
+								className="pressable mt-6 flex w-full items-center justify-center rounded-[1rem] bg-accent px-4 py-4 text-base font-semibold text-white disabled:pointer-events-none disabled:opacity-60"
+								disabled={isTaskSaving}
 								onClick={handleTaskCreate}
 								type="button"
 							>
-								{t.save}
+								{isTaskSaving ? t.saving : t.save}
 							</button>
 						</div>
 					</div>
 				) : null}
 
 				{projectSheetOpen ? (
-					<div className="fixed inset-0 z-20 flex items-end justify-center bg-[rgba(28,40,54,0.28)] px-4 pb-0 pt-10">
-						<div className="w-full max-w-[430px] rounded-t-[2rem] bg-surface px-5 pb-8 pt-5">
+					<div
+						className="fixed inset-0 z-20 flex items-end justify-center bg-[rgba(28,40,54,0.28)] px-4 pb-0 pt-10"
+						onClick={closeProjectSheet}
+					>
+						<div
+							className="w-full max-w-[430px] rounded-t-[2rem] bg-surface px-5 pb-8 pt-5"
+							onClick={(event) => event.stopPropagation()}
+						>
 							<div className="mx-auto h-1.5 w-14 rounded-full bg-border-soft" />
 							<div className="mt-5 flex items-center justify-between">
 								<div>
@@ -1057,15 +1271,22 @@ export function TaskOrbitApp({
 									</h2>
 								</div>
 								<button
-									className="rounded-xl bg-surface-soft px-3 py-2 text-sm font-semibold text-text-muted"
-									onClick={() => setProjectSheetOpen(false)}
+									className="pressable rounded-xl bg-surface-soft px-3 py-2 text-sm font-semibold text-text-muted disabled:pointer-events-none disabled:opacity-60"
+									disabled={isProjectSaving || isProjectDeleting}
+									onClick={closeProjectSheet}
 									type="button"
 								>
 									{t.close}
 								</button>
 							</div>
 
-							<div className="mt-5 space-y-4">
+							<fieldset
+								className={cn(
+									"mt-5 space-y-4",
+									(isProjectSaving || isProjectDeleting) && "opacity-70",
+								)}
+								disabled={isProjectSaving || isProjectDeleting}
+							>
 								<label className="block">
 									<span className="mb-2 block text-sm font-semibold text-foreground">
 										{t.name}
@@ -1092,7 +1313,7 @@ export function TaskOrbitApp({
 											<button
 												key={color}
 												className={cn(
-													"h-10 w-10 rounded-[0.9rem] transition",
+													"pressable h-10 w-10 rounded-[0.9rem] transition",
 													projectEditor.color ===
 														color
 														? "scale-105 shadow-[0_8px_18px_rgba(17,24,28,0.12)]"
@@ -1122,7 +1343,7 @@ export function TaskOrbitApp({
 											<button
 												key={icon}
 												className={cn(
-													"flex h-12 items-center justify-center rounded-[0.95rem] bg-surface-soft transition",
+													"pressable flex h-12 items-center justify-center rounded-[0.95rem] bg-surface-soft transition",
 													projectEditor.icon === icon
 														? "bg-[#eaf6ef] text-accent-strong"
 														: "text-text-muted",
@@ -1147,7 +1368,7 @@ export function TaskOrbitApp({
 									<span className="mb-2 block text-sm font-semibold text-foreground">
 										{t.status}
 									</span>
-									<div className="rounded-[1rem] bg-surface-soft p-1">
+									<div className="grid grid-cols-2 rounded-[0.9rem] bg-surface-soft p-0.5">
 										<SegmentButton
 											active={
 												projectEditor.status ===
@@ -1176,23 +1397,27 @@ export function TaskOrbitApp({
 										/>
 									</div>
 								</div>
-							</div>
+							</fieldset>
 
 							<button
-								className="mt-6 flex w-full items-center justify-center rounded-[1rem] bg-accent px-4 py-4 text-base font-semibold text-white"
+								aria-busy={isProjectSaving}
+								className="pressable mt-6 flex w-full items-center justify-center rounded-[1rem] bg-accent px-4 py-4 text-base font-semibold text-white disabled:pointer-events-none disabled:opacity-60"
+								disabled={isProjectSaving || isProjectDeleting}
 								onClick={handleProjectSave}
 								type="button"
 							>
-								{t.save}
+								{isProjectSaving ? t.saving : t.save}
 							</button>
 
 							{projectEditor.id ? (
 								<button
-									className="mt-3 flex w-full items-center justify-center rounded-[1rem] bg-[#fff3f3] px-4 py-4 text-sm font-semibold text-danger"
+									aria-busy={isProjectDeleting}
+									className="pressable mt-3 flex w-full items-center justify-center rounded-[1rem] bg-[#fff3f3] px-4 py-4 text-sm font-semibold text-danger disabled:pointer-events-none disabled:opacity-60"
+									disabled={isProjectSaving || isProjectDeleting}
 									onClick={handleProjectDelete}
 									type="button"
 								>
-									{t.delete}
+									{isProjectDeleting ? t.deleting : t.delete}
 								</button>
 							) : null}
 						</div>
@@ -1204,9 +1429,10 @@ export function TaskOrbitApp({
 }
 
 function TasksScreen({
-	groupedAllTasks,
 	groupedTasks,
 	locale,
+	movingTaskId,
+	onRecurringAction,
 	onQuickAdd,
 	onMoveTask,
 	preferredTodayLimit,
@@ -1214,28 +1440,33 @@ function TasksScreen({
 	setSelectedTaskId,
 	showDoneColumn,
 }: {
-	groupedAllTasks: ReturnType<typeof groupTasks>;
 	groupedTasks: ReturnType<typeof groupTasks>;
 	locale: AppLocale;
+	movingTaskId: string | null;
+	onRecurringAction: (
+		taskId: string,
+		action: "skip-today" | "pause-repeat",
+	) => void;
 	onQuickAdd: (bucket: TaskBucket) => void;
-	onMoveTask: (taskId: string, bucket: TaskMutationPayload["bucket"]) => void;
+	onMoveTask: (
+		taskId: string,
+		bucket: NonNullable<TaskMutationPayload["bucket"]>,
+	) => void;
 	preferredTodayLimit: number;
 	selectedTaskId: string | null;
 	setSelectedTaskId: (taskId: string | null) => void;
 	showDoneColumn: boolean;
 }) {
 	const t = getDictionary(locale);
-	const sections: TaskBucket[] = showDoneColumn
-		? ["overdue", "today", "tomorrow", "backlog", "done"]
-		: ["overdue", "today", "tomorrow", "backlog"];
+	const sections = useMemo(
+		() =>
+			showDoneColumn
+				? (["overdue", "today", "tomorrow", "backlog", "done"] as TaskBucket[])
+				: (["overdue", "today", "tomorrow", "backlog"] as TaskBucket[]),
+		[showDoneColumn],
+	);
 	const todayCount = groupedTasks.today.length;
 	const overdueCount = groupedTasks.overdue.length;
-	const boardOpenCount =
-		groupedTasks.overdue.length +
-		groupedTasks.today.length +
-		groupedTasks.tomorrow.length +
-		groupedTasks.backlog.length;
-	const allProjectsTodayCount = groupedAllTasks.today.length;
 	const slotsRemaining = Math.max(preferredTodayLimit - todayCount, 0);
 	const todayMessage =
 		overdueCount > 0
@@ -1245,190 +1476,509 @@ function TasksScreen({
 				: todayCount > preferredTodayLimit
 					? t.todayMessageOver(todayCount - preferredTodayLimit)
 					: t.todayMessageLeft(slotsRemaining);
+	const defaultBucket = (
+		overdueCount > 0
+			? "overdue"
+			: todayCount > 0
+				? "today"
+				: (sections.find((bucket) => groupedTasks[bucket].length > 0) ??
+					sections[0])
+	) as TaskBucket;
+	const loopedSections = useMemo(
+		() => [sections[sections.length - 1], ...sections, sections[0]],
+		[sections],
+	);
+	const viewportRef = useRef<HTMLDivElement | null>(null);
+	const touchStartXRef = useRef<number | null>(null);
+	const touchStartTrackIndexRef = useRef<number | null>(null);
+	const resetTimerRef = useRef<number | null>(null);
+	const unlockTimerRef = useRef<number | null>(null);
+	const programmaticScrollRef = useRef(false);
+	const [viewportWidth, setViewportWidth] = useState(0);
+	const [trackIndex, setTrackIndex] = useState(
+		sections.indexOf(defaultBucket) + 1,
+	);
+	const [indicatorPosition, setIndicatorPosition] = useState(
+		sections.indexOf(defaultBucket),
+	);
+	const trackIndexRef = useRef(trackIndex);
+	const CARD_GAP = 12;
+	const trackStep = viewportWidth > 0 ? viewportWidth + CARD_GAP : 0;
+	const activeBucketIndex = (() => {
+		const normalized =
+			((indicatorPosition % sections.length) + sections.length) %
+			sections.length;
+		const integerPart = Math.floor(normalized);
+		const fraction = normalized - integerPart;
+
+		return fraction >= 0.15
+			? (integerPart + 1) % sections.length
+			: integerPart;
+	})();
+	const activeBucket = sections[activeBucketIndex] ?? defaultBucket;
+	const commitTrackState = useCallback(
+		(
+			nextIndex: number,
+			nextIndicator = nextIndex - 1,
+			syncIndicator = true,
+		) => {
+			trackIndexRef.current = nextIndex;
+			setTrackIndex(nextIndex);
+			if (syncIndicator) {
+				setIndicatorPosition(nextIndicator);
+			}
+		},
+		[],
+	);
+
+	useEffect(() => {
+		const node = viewportRef.current;
+
+		if (!node) {
+			return;
+		}
+
+		const syncWidth = () => {
+			setViewportWidth(node.getBoundingClientRect().width);
+		};
+
+		syncWidth();
+		const observer = new ResizeObserver(syncWidth);
+		observer.observe(node);
+
+		return () => {
+			observer.disconnect();
+		};
+	}, []);
+
+	useEffect(() => {
+		const node = viewportRef.current;
+
+		if (!node || trackStep === 0) {
+			return;
+		}
+
+		programmaticScrollRef.current = true;
+		node.scrollTo({
+			left: Math.min(trackIndexRef.current, sections.length) * trackStep,
+			behavior: "auto",
+		});
+
+		const unlockId = window.setTimeout(() => {
+			programmaticScrollRef.current = false;
+		}, 60);
+		unlockTimerRef.current = unlockId;
+
+		return () => {
+			window.clearTimeout(unlockId);
+		};
+	}, [sections.length, trackStep]);
+
+	useEffect(() => {
+		return () => {
+			if (resetTimerRef.current !== null) {
+				window.clearTimeout(resetTimerRef.current);
+			}
+
+			if (unlockTimerRef.current !== null) {
+				window.clearTimeout(unlockTimerRef.current);
+			}
+		};
+	}, []);
+
+	const scrollToTrackIndex = useCallback(
+		(nextIndex: number, behavior: ScrollBehavior = "smooth") => {
+			const node = viewportRef.current;
+
+			if (!node || trackStep === 0) {
+				return;
+			}
+
+			if (unlockTimerRef.current !== null) {
+				window.clearTimeout(unlockTimerRef.current);
+			}
+
+			programmaticScrollRef.current = true;
+			commitTrackState(nextIndex, nextIndex - 1, false);
+			node.scrollTo({
+				left: nextIndex * trackStep,
+				behavior,
+			});
+
+			const unlockId = window.setTimeout(() => {
+				programmaticScrollRef.current = false;
+			}, behavior === "smooth" ? 320 : 60);
+			unlockTimerRef.current = unlockId;
+		},
+		[commitTrackState, trackStep],
+	);
+
+	const handleViewportScroll = useCallback(() => {
+		const node = viewportRef.current;
+
+		if (!node || trackStep === 0) {
+			return;
+		}
+
+		const rawIndex = node.scrollLeft / trackStep;
+		let logicalPosition = rawIndex - 1;
+
+		if (logicalPosition < -0.5) {
+			logicalPosition += sections.length;
+		}
+
+		if (logicalPosition > sections.length - 0.5) {
+			logicalPosition -= sections.length;
+		}
+
+		setIndicatorPosition(logicalPosition);
+
+		const roundedIndex = Math.round(rawIndex);
+		const normalizedIndex =
+			roundedIndex <= 0
+				? sections.length
+				: roundedIndex > sections.length
+					? 1
+					: roundedIndex;
+
+		trackIndexRef.current = normalizedIndex;
+		setTrackIndex(normalizedIndex);
+
+		if (resetTimerRef.current !== null) {
+			window.clearTimeout(resetTimerRef.current);
+		}
+
+		resetTimerRef.current = window.setTimeout(() => {
+			const latestNode = viewportRef.current;
+
+			if (!latestNode) {
+				return;
+			}
+
+			const settledIndex = latestNode.scrollLeft / trackStep;
+
+			if (settledIndex <= 0.5) {
+				scrollToTrackIndex(sections.length, "auto");
+				return;
+			}
+
+			if (settledIndex >= sections.length + 0.5) {
+				scrollToTrackIndex(1, "auto");
+				return;
+			}
+
+			const finalIndex = Math.round(settledIndex);
+			commitTrackState(finalIndex);
+			programmaticScrollRef.current = false;
+		}, 90);
+	}, [commitTrackState, scrollToTrackIndex, sections.length, trackStep]);
 
 	return (
 		<div className="-mx-5 space-y-4">
 			<div className="px-5">
-				<div className="flex items-end justify-between gap-4">
-					<div>
-						<p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-text-muted">
-							{t.board}
-						</p>
-						<h2 className="mt-1 text-lg font-semibold tracking-[-0.04em] text-foreground">
-							{t.today} {todayCount}/{preferredTodayLimit}
-						</h2>
-						<p className="mt-1 text-sm text-text-muted">
-							{todayMessage}
-						</p>
-					</div>
-					<div className="text-right">
-						<p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-text-soft">
-							{t.all}
-						</p>
-						<p className="mt-1 text-sm font-semibold text-foreground">
-							{allProjectsTodayCount} {t.due}
-						</p>
-						<p className="text-xs text-text-muted">
-							{boardOpenCount} {t.open}
-						</p>
-					</div>
+				<p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-text-muted">
+					{t.today}
+				</p>
+				<div className="mt-1 flex items-end justify-between gap-3">
+					<h2 className="text-xl font-semibold tracking-[-0.05em] text-foreground">
+						{todayCount}/{preferredTodayLimit}
+					</h2>
+					<p className="text-sm text-text-muted">{todayMessage}</p>
 				</div>
 			</div>
 
-			<div className="overflow-x-auto px-5 pb-2 [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden">
-				<div className="flex snap-x snap-mandatory gap-4 pr-5">
+			<div className="px-5">
+				<div className="relative mt-0.5 grid" style={{ gridTemplateColumns: `repeat(${sections.length}, minmax(0, 1fr))` }}>
+					<div className="absolute inset-x-0 bottom-0 h-px bg-surface-soft" />
+					<div
+						className="pointer-events-none absolute bottom-0 z-10"
+						style={{
+							width: `${100 / sections.length}%`,
+							transform: `translateX(${indicatorPosition * 100}%)`,
+						}}
+					>
+						<div className="mx-auto h-[2px] w-6 rounded-full bg-accent" />
+					</div>
 					{sections.map((bucket) => (
-						<section
+						<BucketTab
 							key={bucket}
-							className={cn(
-								"flex h-[30rem] w-[84%] shrink-0 snap-start flex-col rounded-[1.2rem] p-3.5",
-								bucket === "done"
-									? "bg-[#ebeee7]"
-									: "bg-[#e7ebe3]",
-							)}
+							active={activeBucket === bucket}
+							label={formatBucketLabel(bucket, locale)}
+							onClick={() => {
+								setSelectedTaskId(null);
+								scrollToTrackIndex(
+									sections.indexOf(bucket) + 1,
+								);
+							}}
+						/>
+					))}
+				</div>
+
+				<div
+					ref={viewportRef}
+					className="mt-3 flex snap-x snap-mandatory gap-3 overflow-x-auto overflow-y-hidden [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden"
+					onScroll={handleViewportScroll}
+					onTouchEnd={(event) => {
+						const startX = touchStartXRef.current;
+						const startTrackIndex = touchStartTrackIndexRef.current;
+						const endX = event.changedTouches[0]?.clientX;
+						touchStartXRef.current = null;
+						touchStartTrackIndexRef.current = null;
+
+						if (
+							startX === null ||
+							startTrackIndex === null ||
+							typeof endX !== "number" ||
+							viewportWidth === 0
+						) {
+							return;
+						}
+
+						const deltaX = endX - startX;
+						const threshold = viewportWidth * 0.15;
+
+						if (Math.abs(deltaX) < threshold) {
+							scrollToTrackIndex(startTrackIndex);
+							return;
+						}
+
+						const nextIndex =
+							deltaX < 0 ? startTrackIndex + 1 : startTrackIndex - 1;
+						scrollToTrackIndex(nextIndex);
+						setSelectedTaskId(null);
+					}}
+					onTouchStart={(event) => {
+						touchStartXRef.current =
+							event.touches[0]?.clientX ?? null;
+						touchStartTrackIndexRef.current = trackIndexRef.current;
+					}}
+					style={{ overscrollBehaviorX: "contain" }}
+				>
+					{loopedSections.map((bucket, index) => (
+						<div
+							key={`${bucket}-${index}`}
+							className="shrink-0 snap-center"
+							style={{
+								width: viewportWidth > 0 ? `${viewportWidth}px` : "100%",
+							}}
 						>
-							<div className="px-0.5 pb-1">
-								<h2 className="text-sm font-semibold text-foreground">
-									{formatBucketLabel(bucket, locale)}
-								</h2>
-							</div>
-
-							<div className="mt-2 flex-1 overflow-y-auto pr-1 [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden">
-								<div className="space-y-2.5 pb-3">
-									{groupedTasks[bucket].length === 0 ? (
-										<div className="px-1 py-6 text-sm text-text-muted">
-											{t.empty}
-										</div>
-									) : null}
-
-									{groupedTasks[bucket].map((task) => {
-										const expanded =
-											selectedTaskId === task.id;
-
-										return (
-											<article
-												key={task.id}
-												className={cn(
-													"rounded-[1rem] bg-white transition",
-													bucket === "overdue" &&
-														!expanded &&
-														"bg-[#fff7f5]",
-													bucket === "done" &&
-														!expanded &&
-														"bg-[#fbfcfa]",
-												)}
-											>
-												<button
-													className="flex w-full items-start gap-3 px-3.5 py-3 text-left"
-													onClick={() =>
-														setSelectedTaskId(
-															expanded
-																? null
-																: task.id,
-														)
-													}
-													type="button"
-												>
-													<span className="min-w-0 flex-1">
-														<span className="flex items-start justify-between gap-3">
-															<span>
-																<span className="block text-[12px] font-semibold leading-5 text-foreground">
-																	{task.title}
-																</span>
-																<span className="mt-1 block text-[10px] text-text-muted">
-																	{formatTaskMeta(task, locale)}
-																</span>
-															</span>
-															<Link
-																aria-label={t.openDetails(task.title)}
-																className="rounded-md p-0.5 text-text-soft"
-																href={`/tasks/${task.id}`}
-																onClick={(
-																	event,
-																) =>
-																	event.stopPropagation()
-																}
-															>
-																<ChevronRight className="h-3.5 w-3.5" />
-															</Link>
-														</span>
-													</span>
-												</button>
-
-												{expanded ? (
-													<div className="rounded-b-[1rem] grid grid-cols-3 bg-[#eef1ea] text-[11px] font-semibold">
-														<ActionButton
-															accent="success"
-															disabled={
-																bucket ===
-																"today"
-															}
-															label={t.today}
-															onClick={() =>
-																onMoveTask(
-																	task.id,
-																	"today",
-																)
-															}
-														/>
-														<ActionButton
-															accent="neutral"
-															disabled={
-																bucket ===
-																"tomorrow"
-															}
-															label={t.tomorrow}
-															onClick={() =>
-																onMoveTask(
-																	task.id,
-																	"tomorrow",
-																)
-															}
-														/>
-														<ActionButton
-															accent={
-																bucket ===
-																"done"
-																	? "neutral"
-																	: "danger"
-															}
-															label={
-																bucket ===
-																"done"
-																	? t.backlog
-																	: t.done
-															}
-															onClick={() =>
-																onMoveTask(
-																	task.id,
-																	bucket ===
-																		"done"
-																		? "backlog"
-																		: "done",
-																)
-															}
-														/>
-													</div>
-												) : null}
-											</article>
-										);
-									})}
-								</div>
-							</div>
-
-							<button
-								className="mt-2 flex items-center gap-2 px-1.5 py-2 text-xs font-semibold text-text-muted transition hover:text-accent-strong"
-								onClick={() => onQuickAdd(bucket)}
-								type="button"
-							>
-								<Plus className="h-4 w-4" />
-									{t.add}
-							</button>
-						</section>
+							<TaskBucketCard
+								bucket={bucket}
+								locale={locale}
+								movingTaskId={movingTaskId}
+								onRecurringAction={onRecurringAction}
+								onMoveTask={onMoveTask}
+								onQuickAdd={onQuickAdd}
+								selectedTaskId={selectedTaskId}
+								setSelectedTaskId={setSelectedTaskId}
+								tasks={groupedTasks[bucket]}
+							/>
+						</div>
 					))}
 				</div>
 			</div>
 		</div>
+	);
+}
+
+function TaskBucketCard({
+	bucket,
+	locale,
+	movingTaskId,
+	onRecurringAction,
+	onMoveTask,
+	onQuickAdd,
+	selectedTaskId,
+	setSelectedTaskId,
+	tasks,
+}: {
+	bucket: TaskBucket;
+	locale: AppLocale;
+	movingTaskId: string | null;
+	onRecurringAction: (
+		taskId: string,
+		action: "skip-today" | "pause-repeat",
+	) => void;
+	onMoveTask: (
+		taskId: string,
+		bucket: NonNullable<TaskMutationPayload["bucket"]>,
+	) => void;
+	onQuickAdd: (bucket: TaskBucket) => void;
+	selectedTaskId: string | null;
+	setSelectedTaskId: (taskId: string | null) => void;
+	tasks: Task[];
+}) {
+	const t = getDictionary(locale);
+	const quickAddBucket =
+		bucket === "today" || bucket === "tomorrow" || bucket === "backlog"
+			? bucket
+			: "backlog";
+	const emptyHint =
+		bucket === "overdue"
+			? t.emptyOverdueHint
+			: bucket === "today"
+				? t.emptyTodayHint
+				: bucket === "tomorrow"
+					? t.emptyTomorrowHint
+					: bucket === "done"
+						? t.emptyDoneHint
+						: t.emptyBacklogHint;
+
+	return (
+		<section
+			className={cn(
+				"flex min-h-[31rem] min-w-0 flex-col rounded-[1.25rem] px-3.5 py-3.5 shadow-[0_6px_20px_rgba(17,24,28,0.03)]",
+				bucket === "overdue"
+					? "bg-[#ede8e4]"
+					: bucket === "done"
+						? "bg-[#eaede6]"
+						: "bg-[#e7ebe3]",
+			)}
+		>
+			<div className="flex-1 overflow-y-auto pr-1 [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden">
+				<div className="space-y-2.5 pb-3">
+					{tasks.length === 0 ? (
+						<InlineEmptyState
+							hint={emptyHint}
+						/>
+					) : null}
+
+					{tasks.map((task) => {
+						const expanded = selectedTaskId === task.id;
+						const isMoving = movingTaskId === task.id;
+
+						return (
+							<article
+								key={task.id}
+								className={cn(
+									"rounded-[1rem] bg-white transition",
+									bucket === "overdue" && !expanded && "bg-[#fff7f5]",
+									bucket === "done" && !expanded && "bg-[#fbfcfa]",
+								)}
+							>
+								<button
+									className="pressable-row flex w-full items-start gap-3 rounded-[1rem] px-3.5 py-3 text-left disabled:pointer-events-none disabled:opacity-60"
+									disabled={isMoving}
+									onClick={() =>
+										setSelectedTaskId(expanded ? null : task.id)
+									}
+									type="button"
+								>
+									<span className="min-w-0 flex-1">
+										<span className="flex items-start justify-between gap-3">
+											<span>
+												<span className="block text-[12px] font-semibold leading-5 text-foreground">
+													{task.title}
+												</span>
+												<span className="mt-1 flex items-center gap-2 text-[10px] text-text-muted">
+													<span>{formatTaskMeta(task, locale)}</span>
+													{task.repeatType ? (
+														<span className="rounded-md bg-surface-soft px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-[0.08em] text-accent-strong">
+															{task.repeatType === "daily" ? t.daily : t.weekdays}
+														</span>
+													) : null}
+												</span>
+											</span>
+											<Link
+												aria-label={t.openDetails(task.title)}
+												className="pressable rounded-md p-0.5 text-text-soft"
+												href={`/tasks/${task.id}`}
+												onClick={(event) => event.stopPropagation()}
+											>
+												<ChevronRight className="h-3.5 w-3.5" />
+											</Link>
+										</span>
+									</span>
+								</button>
+
+								{expanded ? (
+									<div className="grid grid-cols-3 rounded-b-[1rem] bg-[#eef1ea] text-[11px] font-semibold">
+										{task.repeatType ? (
+											<>
+												<ActionButton
+													accent={bucket === "done" ? "neutral" : "success"}
+													disabled={isMoving}
+													label={bucket === "done" ? t.today : t.done}
+													pending={isMoving}
+													pendingLabel={t.moving}
+													onClick={() =>
+														onMoveTask(
+															task.id,
+															bucket === "done" ? "today" : "done",
+														)
+													}
+												/>
+												<ActionButton
+													accent="neutral"
+													disabled={isMoving}
+													label={t.skip}
+													pending={isMoving}
+													pendingLabel={t.moving}
+													onClick={() =>
+														onRecurringAction(task.id, "skip-today")
+													}
+												/>
+												<ActionButton
+													accent="danger"
+													disabled={isMoving}
+													label={t.pause}
+													pending={isMoving}
+													pendingLabel={t.moving}
+													onClick={() =>
+														onRecurringAction(task.id, "pause-repeat")
+													}
+												/>
+											</>
+										) : (
+											<>
+												<ActionButton
+													accent="success"
+													disabled={bucket === "today" || isMoving}
+													label={t.today}
+													pending={isMoving}
+													pendingLabel={t.moving}
+													onClick={() => onMoveTask(task.id, "today")}
+												/>
+												<ActionButton
+													accent="neutral"
+													disabled={bucket === "tomorrow" || isMoving}
+													label={t.tomorrow}
+													pending={isMoving}
+													pendingLabel={t.moving}
+													onClick={() => onMoveTask(task.id, "tomorrow")}
+												/>
+												<ActionButton
+													accent={bucket === "done" ? "neutral" : "danger"}
+													disabled={isMoving}
+													label={bucket === "done" ? t.backlog : t.done}
+													pending={isMoving}
+													pendingLabel={t.moving}
+													onClick={() =>
+														onMoveTask(
+															task.id,
+															bucket === "done" ? "backlog" : "done",
+														)
+													}
+												/>
+											</>
+										)}
+									</div>
+								) : null}
+							</article>
+						);
+					})}
+				</div>
+			</div>
+
+			<button
+				aria-label={t.add}
+				className="pressable ml-auto mt-2 flex h-8 w-8 items-center justify-center rounded-[0.8rem] text-text-muted transition hover:text-accent-strong"
+				onClick={() => onQuickAdd(quickAddBucket)}
+				type="button"
+			>
+				<Plus className="h-4 w-4" />
+			</button>
+		</section>
 	);
 }
 
@@ -1485,20 +2035,13 @@ function ProjectsScreen({
 
 	return (
 		<div className="space-y-5">
-			<div className="flex items-center justify-between">
-				<div>
-					<p className="text-sm font-semibold text-accent-strong">
-						{t.projects}
-					</p>
-				</div>
-				<button
-					className="inline-flex items-center gap-2 rounded-xl bg-accent px-4 py-2.5 text-sm font-semibold text-white"
-					onClick={onCreateProject}
-					type="button"
-				>
-					<Plus className="h-4 w-4" />
-					{t.new}
-				</button>
+			<div>
+				<h1 className="text-lg font-semibold tracking-[-0.04em] text-foreground">
+					{t.projects}
+				</h1>
+				<p className="mt-1 text-sm text-text-muted">
+					{totalToday} {t.today} · {totalOverdue} {t.overdue} · {t.paused(pausedProjects)}
+				</p>
 			</div>
 
 			<section className="grid grid-cols-2 gap-3">
@@ -1508,12 +2051,31 @@ function ProjectsScreen({
 				<CompactMetric label={t.backlog} value={totalBacklog} />
 			</section>
 
-			<div className="flex items-center justify-between text-xs text-text-muted">
-				<p>{t.paused(pausedProjects)}</p>
-				<p>{t.limitCount(preferredTodayLimit)}</p>
+			<div className="flex items-center justify-between">
+				<div>
+					<p className="text-sm font-semibold text-foreground">Project List</p>
+					<p className="mt-1 text-[12px] text-text-muted">
+						{t.limitCount(preferredTodayLimit)}
+					</p>
+				</div>
+				<button
+					className="pressable inline-flex items-center gap-2 rounded-[0.9rem] bg-accent px-4 py-2.5 text-sm font-semibold text-white"
+					onClick={onCreateProject}
+					type="button"
+				>
+					<Plus className="h-4 w-4" />
+					{t.new}
+				</button>
 			</div>
 
-			<div className="space-y-2">
+			<div className="overflow-hidden rounded-[1.05rem] bg-surface-muted">
+				{rankedProjects.length === 0 ? (
+					<div className="px-4 py-4">
+						<InlineEmptyState
+							hint={t.emptyProjectsHint}
+						/>
+					</div>
+				) : null}
 				{rankedProjects.map((project) => {
 					const stats = getProjectStats(project, tasks);
 					const backlog = tasks.filter(
@@ -1535,84 +2097,98 @@ function ProjectsScreen({
 									: t.clear;
 
 					return (
-						<button
-							key={project.id}
-							className="w-full rounded-[1.05rem] bg-surface-muted px-4 py-4 text-left transition hover:bg-surface-soft"
-							onClick={() => onEditProject(project)}
-							type="button"
-						>
-							<div className="flex items-start justify-between gap-4">
-								<div className="flex items-center gap-3">
-									<span
-										className="flex h-10 w-10 items-center justify-center rounded-[0.9rem]"
-										style={{
-											backgroundColor: `${project.color}1A`,
-											color: project.color,
-										}}
-									>
-										{projectIcon(project.icon, "h-4 w-4")}
-									</span>
-									<div>
-										<h2 className="text-sm font-semibold text-foreground">
-											{project.name}
-										</h2>
-										<p className="mt-1 text-xs text-text-muted">
-											{statusCopy}
-										</p>
+						<div key={project.id}>
+							<div className="px-4 py-4">
+								<div className="flex items-start justify-between gap-3">
+									<div className="flex min-w-0 items-center gap-3">
+										<span
+											className="flex h-10 w-10 items-center justify-center rounded-[0.9rem]"
+											style={{
+												backgroundColor: `${project.color}1A`,
+												color: project.color,
+											}}
+										>
+											{projectIcon(project.icon, "h-4 w-4")}
+										</span>
+										<div className="min-w-0">
+											<div className="flex items-center gap-2">
+												<h2 className="truncate text-sm font-semibold text-foreground">
+													{project.name}
+												</h2>
+												<span
+													className={cn(
+														"shrink-0 rounded-md px-1.5 py-0.5 text-[10px] font-semibold",
+														project.status === "active"
+															? "bg-surface text-accent-strong"
+															: "bg-surface text-text-muted",
+													)}
+												>
+													{project.status === "active"
+														? t.active
+														: t.pausedLabel}
+												</span>
+											</div>
+											<p className="mt-1 text-[12px] leading-5 text-text-muted">
+												{statusCopy}
+											</p>
+										</div>
 									</div>
+									<button
+										aria-label={`${t.edit} ${project.name}`}
+										className="pressable flex h-8 w-8 items-center justify-center rounded-[0.8rem] bg-surface text-text-muted"
+										onClick={() => onEditProject(project)}
+										type="button"
+									>
+										<Pencil className="h-4 w-4" />
+									</button>
 								</div>
-									<div className="text-right">
-										<p className="text-xs font-semibold uppercase tracking-[0.16em] text-text-soft">
-											{project.status === "active"
-												? t.active
-												: t.pausedLabel}
-										</p>
-									<p className="mt-1 text-sm font-semibold text-foreground">
-										{t.projectOpen(openCount)}
+
+								<div className="mt-3 grid grid-cols-4 gap-2">
+									<ProjectStat
+										label={t.today}
+										tone={overLimit ? "warning" : "default"}
+										value={stats.today}
+									/>
+									<ProjectStat
+										label={t.overdue}
+										tone={needsAttention ? "danger" : "default"}
+										value={stats.overdue}
+									/>
+									<ProjectStat
+										label={t.backlog}
+										value={backlog}
+									/>
+									<ProjectStat
+										label={t.done}
+										value={stats.done}
+									/>
+								</div>
+
+								<div className="mt-3 flex items-center justify-between text-[11px]">
+									<p className="text-text-muted">{t.projectOpen(openCount)}</p>
+									<p
+										className={cn(
+											"font-semibold",
+											needsAttention
+												? "text-danger"
+												: overLimit
+													? "text-[#b7832f]"
+													: "text-accent-strong",
+										)}
+									>
+										{needsAttention
+											? t.risk
+											: overLimit
+												? t.full
+												: t.ok}
 									</p>
 								</div>
 							</div>
-
-							<div className="mt-4 grid grid-cols-4 gap-2">
-								<ProjectStatInline
-									label={t.today}
-									value={stats.today}
-								/>
-								<ProjectStatInline
-									label={t.overdue}
-									tone={needsAttention ? "danger" : "default"}
-									value={stats.overdue}
-								/>
-								<ProjectStatInline
-									label={t.backlog}
-									value={backlog}
-								/>
-								<ProjectStatInline
-									label={t.done}
-									value={stats.done}
-								/>
-							</div>
-
-							<div className="mt-4 flex items-center justify-between text-xs text-text-muted">
-									<p>{t.doneRate(stats.completionRate)}</p>
-								<p
-									className={cn(
-										"font-semibold",
-										needsAttention
-											? "text-danger"
-											: overLimit
-												? "text-[#b7832f]"
-												: "text-accent-strong",
-									)}
-								>
-									{needsAttention
-										? t.risk
-										: overLimit
-											? t.full
-											: t.ok}
-								</p>
-							</div>
-						</button>
+							{project.id !==
+							rankedProjects[rankedProjects.length - 1]?.id ? (
+								<div className="mx-4 h-px bg-surface-soft" />
+							) : null}
+						</div>
 					);
 				})}
 			</div>
@@ -1678,13 +2254,13 @@ function ReviewScreen({
 	return (
 		<div className="space-y-5">
 			<div>
-					<p className="text-sm font-semibold text-accent-strong">
-						{t.review}
-					</p>
-					<h2 className="mt-1 text-lg font-semibold tracking-[-0.04em] text-foreground">
-						{t.review}
-					</h2>
-				</div>
+				<h1 className="text-lg font-semibold tracking-[-0.04em] text-foreground">
+					{t.review}
+				</h1>
+				<p className="mt-1 text-sm text-text-muted">
+					{doneThisWeek} {t.done} · {weeklyHitRate}% {t.hit}
+				</p>
+			</div>
 
 			<section className="grid grid-cols-2 gap-3">
 				<CompactMetric
@@ -1696,40 +2272,40 @@ function ReviewScreen({
 				<CompactMetric label={t.done} value={doneThisWeek} />
 			</section>
 
-			<section className="rounded-[1.1rem] bg-surface-muted px-4 py-4">
+			<section className="rounded-[1rem] bg-surface-muted px-4 py-4">
 				<div className="flex items-center justify-between">
 					<div>
-						<p className="text-xs font-semibold uppercase tracking-[0.16em] text-text-soft">
+						<p className="text-sm font-medium text-foreground">
 							{t.week}
 						</p>
-						<p className="mt-1 text-sm text-text-muted">
+						<p className="mt-1 text-[12px] text-text-muted">
 							{t.planDone(plannedThisWeek, doneThisWeek)}
 						</p>
 					</div>
-					<p className="text-sm font-semibold text-foreground">
+					<p className="text-sm font-medium text-foreground">
 						{totalTomorrow} {t.next}
 					</p>
 				</div>
 
-				<div className="mt-4 grid grid-cols-7 gap-2">
+				<div className="mt-4 grid grid-cols-7 gap-1.5">
 					{weekBuckets.map((bucket) => (
 						<div
 							key={bucket.date}
 							className={cn(
-								"rounded-[0.9rem] px-2 py-3",
-								bucket.isToday ? "bg-white" : "bg-[#f5f7f2]",
+								"rounded-[0.85rem] px-2 py-2.5",
+								bucket.isToday ? "bg-surface text-foreground" : "bg-transparent",
 							)}
 						>
-							<p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-text-soft">
+							<p className="text-[10px] font-medium text-text-soft">
 								{formatLocaleWeekday(bucket.date, locale)}
 							</p>
-							<p className="mt-2 text-base font-semibold text-foreground">
+							<p className="mt-1.5 text-sm font-semibold text-foreground">
 								{bucket.dayNumber}
 							</p>
-							<p className="mt-2 text-[11px] text-text-muted">
+							<p className="mt-1.5 text-[10px] text-text-muted">
 								{bucket.plannedCount} {t.due}
 							</p>
-							<p className="text-[11px] text-accent-strong">
+							<p className="text-[10px] text-accent-strong">
 								{bucket.doneCount} {t.done}
 							</p>
 						</div>
@@ -1750,49 +2326,47 @@ function ReviewScreen({
 				</div>
 
 				{attentionProjects.length === 0 ? (
-					<div className="rounded-[1rem] bg-surface-muted px-4 py-4 text-sm text-text-muted">
-						{t.clear}
+					<div className="rounded-[1rem] bg-surface-muted px-4 py-4">
+						<InlineEmptyState
+							hint={t.emptyQueueHint}
+						/>
 					</div>
 				) : (
-					<div className="space-y-2">
-						{attentionProjects.map(({backlog, project, stats}) => (
-							<div
-								key={project.id}
-								className="rounded-[1rem] bg-surface-muted px-4 py-4"
-							>
-								<div className="flex items-center justify-between gap-4">
-									<div className="flex items-center gap-3">
+					<div className="overflow-hidden rounded-[1rem] bg-surface-muted">
+						{attentionProjects.map(({backlog, project, stats}, index) => (
+							<div key={project.id}>
+								<div className="flex items-center justify-between gap-4 px-4 py-3.5">
+									<div className="flex min-w-0 items-center gap-3">
 										<span
-											className="flex h-9 w-9 items-center justify-center rounded-[0.9rem]"
+											className="flex h-8 w-8 items-center justify-center rounded-[0.85rem]"
 											style={{
 												backgroundColor: `${project.color}1A`,
 												color: project.color,
 											}}
 										>
-											{projectIcon(
-												project.icon,
-												"h-4 w-4",
-											)}
+											{projectIcon(project.icon, "h-4 w-4")}
 										</span>
-										<div>
-											<p className="text-sm font-semibold text-foreground">
+										<div className="min-w-0">
+											<p className="truncate text-sm font-medium text-foreground">
 												{project.name}
 											</p>
-											<p className="mt-1 text-xs text-text-muted">
+											<p className="mt-0.5 text-[12px] text-text-muted">
 												{stats.overdue > 0
-														? t.attentionOverdue(stats.overdue)
-														: stats.today >
-														  preferredTodayLimit
+													? t.attentionOverdue(stats.overdue)
+													: stats.today > preferredTodayLimit
 														? t.attentionToday(stats.today)
 														: t.attentionBacklog(backlog)}
 											</p>
 										</div>
 									</div>
-									<div className="text-right text-xs text-text-muted">
+									<div className="shrink-0 text-right text-[12px] text-text-muted">
 										<p>{stats.today} {t.today}</p>
 										<p>{backlog} {t.backlog}</p>
 									</div>
 								</div>
+								{index !== attentionProjects.length - 1 ? (
+									<div className="mx-4 h-px bg-surface-soft" />
+								) : null}
 							</div>
 						))}
 					</div>
@@ -1808,7 +2382,10 @@ function ReviewScreen({
 }
 
 function SettingsScreen({
+	isAuthRouting,
+	isLocaleSaving,
 	locale,
+	onAuthRoute,
 	onDefaultBucketChange,
 	onDoneColumnToggle,
 	onLocaleChange,
@@ -1818,7 +2395,10 @@ function SettingsScreen({
 	viewer,
 	source,
 }: {
+	isAuthRouting: boolean;
+	isLocaleSaving: boolean;
 	locale: AppLocale;
+	onAuthRoute: () => void;
 	onDefaultBucketChange: (bucket: ComposerState["bucket"]) => void;
 	onDoneColumnToggle: () => void;
 	onLocaleChange: (locale: AppLocale) => void;
@@ -1833,33 +2413,42 @@ function SettingsScreen({
 		<div className="space-y-6">
 			<section className="space-y-3">
 				<div>
-					<p className="text-sm font-semibold text-accent-strong">
+					<h1 className="text-lg font-semibold tracking-[-0.04em] text-foreground">
 						{t.account}
-					</p>
-					<h2 className="mt-1 text-lg font-semibold tracking-[-0.04em] text-foreground">
+					</h1>
+					<p className="mt-1 text-sm text-text-muted">
 						{viewer.isAuthenticated ? viewer.label : t.sync}
-					</h2>
+					</p>
 					<p className="mt-1 text-sm leading-6 text-text-muted">
 						{viewer.isAuthenticated
 							? viewer.email
 							: t.settingsSyncHint}
 					</p>
 				</div>
-				<div className="flex items-center justify-between rounded-[1rem] bg-surface-muted px-4 py-4">
-					<div>
-						<p className="text-sm font-semibold text-foreground">
-							{t.sync}
-						</p>
-						<p className="mt-1 text-xs text-text-muted">
-							{source === "supabase" ? t.cloud : t.demo}
-						</p>
+				<div className="overflow-hidden rounded-[1rem] bg-surface">
+					<div className="flex items-center justify-between px-4 py-4">
+						<div>
+							<p className="text-sm font-semibold text-foreground">
+								{t.sync}
+							</p>
+							<p className="mt-1 text-xs text-text-muted">
+								{source === "supabase" ? t.cloud : t.demo}
+							</p>
+						</div>
+						<button
+							aria-busy={isAuthRouting}
+							className="pressable inline-flex items-center rounded-[0.9rem] bg-accent px-4 py-2.5 text-sm font-semibold text-white disabled:pointer-events-none disabled:opacity-60"
+							disabled={isAuthRouting}
+							onClick={onAuthRoute}
+							type="button"
+						>
+							{isAuthRouting
+								? t.opening
+								: viewer.isAuthenticated
+									? t.signOut
+									: t.signIn}
+						</button>
 					</div>
-					<Link
-						className="inline-flex items-center rounded-[0.9rem] bg-accent px-4 py-2.5 text-sm font-semibold text-white"
-						href="/login"
-					>
-						{viewer.isAuthenticated ? t.manage : t.signIn}
-					</Link>
 				</div>
 			</section>
 
@@ -1870,113 +2459,113 @@ function SettingsScreen({
 					</p>
 				</div>
 
-				<div className="space-y-3 rounded-[1rem] bg-surface-muted px-4 py-4">
-					<ToggleSettingRow
-						description={t.openToday}
-						enabled={preferences.openReminderEnabled}
-						label={t.reminder}
-						onToggle={onReminderToggle}
-					/>
-					<ToggleSettingRow
-						description={t.showDoneInBoard}
-						enabled={preferences.showDoneColumn}
-						label={t.showDone}
-						onToggle={onDoneColumnToggle}
-					/>
-				</div>
-
-				<div className="rounded-[1rem] bg-surface-muted px-4 py-4">
-					<div className="flex items-start justify-between gap-4">
-						<div>
-							<p className="text-sm font-semibold text-foreground">
-								{t.language}
-							</p>
-						</div>
-						<p className="text-xs font-semibold uppercase tracking-[0.16em] text-text-soft">
-							{locale === "zh" ? t.chinese : t.english}
-						</p>
-					</div>
-					<div className="mt-4 flex gap-2">
-						<ChoiceChip
-							active={locale === "en"}
-							label={t.english}
-							onClick={() => onLocaleChange("en")}
-						/>
-						<ChoiceChip
-							active={locale === "zh"}
-							label={t.chinese}
-							onClick={() => onLocaleChange("zh")}
+				<div className="overflow-hidden rounded-[1rem] bg-surface">
+					<div className="px-4 py-3">
+						<ToggleSettingRow
+							description={t.openToday}
+							enabled={preferences.openReminderEnabled}
+							label={t.reminder}
+							onToggle={onReminderToggle}
 						/>
 					</div>
-				</div>
-
-				<div className="rounded-[1rem] bg-surface-muted px-4 py-4">
-					<div className="flex items-start justify-between gap-4">
-						<div>
-							<p className="text-sm font-semibold text-foreground">
-								{t.defaultBucket}
-							</p>
-							<p className="mt-1 text-xs text-text-muted">
-								{t.newTaskList}
-							</p>
-						</div>
-						<p className="text-xs font-semibold uppercase tracking-[0.16em] text-text-soft">
-							{formatBucketLabel(preferences.defaultTaskBucket, locale)}
-						</p>
+					<div className="mx-4 h-px bg-surface-soft" />
+					<div className="px-4 py-3">
+						<ToggleSettingRow
+							description={t.showDoneInBoard}
+							enabled={preferences.showDoneColumn}
+							label={t.showDone}
+							onToggle={onDoneColumnToggle}
+						/>
 					</div>
-					<div className="mt-4 flex gap-2">
-						{(["backlog", "today", "tomorrow"] as const).map(
-							(bucket) => (
-								<ChoiceChip
-									key={bucket}
-									active={
-										preferences.defaultTaskBucket === bucket
-									}
-									label={formatBucketLabel(bucket, locale)}
-									onClick={() =>
-										onDefaultBucketChange(bucket)
-									}
-								/>
-							),
-						)}
-					</div>
-				</div>
-
-				<div className="rounded-[1rem] bg-surface-muted px-4 py-4">
-					<div className="flex items-start justify-between gap-4">
-						<div>
-							<p className="text-sm font-semibold text-foreground">
-								{t.todayCap}
-							</p>
-							<p className="mt-1 text-xs text-text-muted">
-								{t.todayCapHint}
-							</p>
-						</div>
-						<p className="text-xs font-semibold uppercase tracking-[0.16em] text-text-soft">
-							{preferences.preferredTodayLimit}
-						</p>
-					</div>
-					<div className="mt-4 flex gap-2">
-						{TODAY_LIMIT_OPTIONS.map((limit) => (
+					<div className="mx-4 h-px bg-surface-soft" />
+					<div className="px-4 py-3">
+						<ChoiceSettingRow
+							label={t.language}
+							description={
+								locale === "zh" ? t.chinese : t.english
+							}
+						>
 							<ChoiceChip
-								key={limit}
-								active={
-									preferences.preferredTodayLimit === limit
-								}
-								label={`${limit}`}
-								onClick={() => onTodayLimitChange(limit)}
+								active={locale === "en"}
+								disabled={isLocaleSaving}
+								label={t.english}
+								onClick={() => onLocaleChange("en")}
 							/>
-						))}
+							<ChoiceChip
+								active={locale === "zh"}
+								disabled={isLocaleSaving}
+								label={t.chinese}
+								onClick={() => onLocaleChange("zh")}
+							/>
+						</ChoiceSettingRow>
+					</div>
+					<div className="mx-4 h-px bg-surface-soft" />
+					<div className="px-4 py-3">
+						<ChoiceSettingRow
+							label={t.defaultBucket}
+							description={formatBucketLabel(
+								preferences.defaultTaskBucket,
+								locale,
+							)}
+						>
+							{(["backlog", "today", "tomorrow"] as const).map(
+								(bucket) => (
+									<ChoiceChip
+										key={bucket}
+										active={
+											preferences.defaultTaskBucket ===
+											bucket
+										}
+										label={formatBucketLabel(
+											bucket,
+											locale,
+										)}
+										onClick={() =>
+											onDefaultBucketChange(bucket)
+										}
+									/>
+								),
+							)}
+						</ChoiceSettingRow>
+					</div>
+					<div className="mx-4 h-px bg-surface-soft" />
+					<div className="px-4 py-3">
+						<ChoiceSettingRow
+							label={t.todayCap}
+							description={`${preferences.preferredTodayLimit}`}
+						>
+							{TODAY_LIMIT_OPTIONS.map((limit) => (
+								<ChoiceChip
+									key={limit}
+									active={
+										preferences.preferredTodayLimit ===
+										limit
+									}
+									label={`${limit}`}
+									onClick={() => onTodayLimitChange(limit)}
+								/>
+							))}
+						</ChoiceSettingRow>
 					</div>
 				</div>
 			</section>
 
-			<section className="rounded-[1rem] bg-surface-muted px-4 py-4">
-				<p className="text-sm font-semibold text-foreground">{t.rules}</p>
-				<div className="mt-4 space-y-3 text-sm text-text-muted">
-					<p>{t.tomorrowRule}</p>
-					<p>{t.overdueRule}</p>
-					<p>{t.editRule}</p>
+			<section className="space-y-3">
+				<p className="text-sm font-semibold text-foreground">
+					{t.rules}
+				</p>
+				<div className="overflow-hidden rounded-[1rem] bg-surface">
+					<div className="px-4 py-4 text-sm text-text-muted">
+						{t.tomorrowRule}
+					</div>
+					<div className="mx-4 h-px bg-surface-soft" />
+					<div className="px-4 py-4 text-sm text-text-muted">
+						{t.overdueRule}
+					</div>
+					<div className="mx-4 h-px bg-surface-soft" />
+					<div className="px-4 py-4 text-sm text-text-muted">
+						{t.editRule}
+					</div>
 				</div>
 			</section>
 		</div>
@@ -1999,7 +2588,7 @@ function ProjectChip({
 	return (
 		<button
 			className={cn(
-				"inline-flex shrink-0 items-center gap-2 rounded-4xl px-3 py-2 text-sm font-semibold transition",
+				"pressable inline-flex shrink-0 items-center gap-2 rounded-4xl px-3 py-2 text-sm font-semibold transition",
 				active
 					? "bg-surface text-foreground"
 					: "bg-surface-soft text-text-muted",
@@ -2030,7 +2619,7 @@ function SegmentButton({
 	return (
 		<button
 			className={cn(
-				"rounded-[0.9rem] px-4 py-3 text-sm font-semibold transition",
+				"pressable flex min-h-10 w-full min-w-0 items-center justify-center rounded-[0.75rem] px-2.5 py-2 text-center text-[13px] font-medium transition",
 				active
 					? "bg-white text-accent-strong shadow-[0_2px_8px_rgba(17,24,28,0.04)]"
 					: "text-foreground",
@@ -2047,17 +2636,22 @@ function ActionButton({
 	accent,
 	disabled,
 	label,
+	pending,
+	pendingLabel,
 	onClick,
 }: {
 	accent: "success" | "danger" | "neutral";
 	disabled?: boolean;
 	label: string;
+	pending?: boolean;
+	pendingLabel: string;
 	onClick: () => void;
 }) {
 	return (
 		<button
+			aria-busy={pending}
 			className={cn(
-				"px-3 py-3 text-center transition first:rounded-bl-[1rem] last:rounded-br-[1rem]",
+				"pressable px-3 py-3 text-center transition first:rounded-bl-[1rem] last:rounded-br-[1rem] disabled:pointer-events-none disabled:opacity-60",
 				accent === "success" && !disabled && "text-accent-strong",
 				accent === "danger" && !disabled && "text-danger",
 				accent === "neutral" && !disabled && "text-foreground",
@@ -2067,7 +2661,7 @@ function ActionButton({
 			onClick={onClick}
 			type="button"
 		>
-			{label}
+			{pending ? pendingLabel : label}
 		</button>
 	);
 }
@@ -2084,7 +2678,7 @@ function NavButton({
 	return (
 		<button
 			className={cn(
-				"flex min-w-0 items-center justify-center px-1",
+				"pressable flex min-w-0 items-center justify-center px-1",
 				active ? "text-accent-strong" : "text-foreground",
 			)}
 			onClick={onClick}
@@ -2110,40 +2704,81 @@ function CompactMetric({
 	value: number | string;
 }) {
 	return (
-		<div className="rounded-[1rem] bg-surface-muted px-4 py-4">
-			<p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-text-soft">
+		<div className="rounded-[0.95rem] bg-surface-muted px-4 py-3.5">
+			<p className="text-[12px] font-medium text-text-muted">
 				{label}
 			</p>
-			<p className="mt-2 text-xl font-semibold tracking-[-0.04em] text-foreground">
+			<p className="mt-1.5 text-lg font-semibold tracking-[-0.04em] text-foreground">
 				{value}
 			</p>
 		</div>
 	);
 }
 
-function ProjectStatInline({
+function ProjectStat({
 	label,
 	tone = "default",
 	value,
 }: {
 	label: string;
-	tone?: "default" | "danger";
+	tone?: "default" | "danger" | "warning";
 	value: number;
 }) {
 	return (
-		<div className="space-y-1">
-			<p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-text-soft">
-				{label}
-			</p>
+		<div className="rounded-[0.8rem] bg-surface px-2 py-2 text-center">
+			<p className="text-[10px] text-text-soft">{label}</p>
 			<p
 				className={cn(
-					"text-sm font-semibold",
-					tone === "danger" ? "text-danger" : "text-foreground",
+					"mt-1 text-sm font-semibold",
+					tone === "danger"
+						? "text-danger"
+						: tone === "warning"
+							? "text-[#b7832f]"
+							: "text-foreground",
 				)}
 			>
 				{value}
 			</p>
 		</div>
+	);
+}
+
+function InlineEmptyState({
+	hint,
+}: {
+	hint: string;
+}) {
+	return (
+		<div className="flex min-h-44 items-center justify-center px-5 py-8 text-center">
+			<p className="max-w-[14rem] text-[12px] leading-5 text-text-soft">
+				{hint}
+			</p>
+		</div>
+	);
+}
+
+function BucketTab({
+	active,
+	label,
+	onClick,
+}: {
+	active: boolean;
+	label: string;
+	onClick: () => void;
+}) {
+	return (
+		<button
+			className={cn(
+				"pressable px-0.5 pb-3 text-center text-[12px] font-semibold transition",
+				active
+					? "text-accent-strong"
+					: "text-text-muted",
+			)}
+			onClick={onClick}
+			type="button"
+		>
+			{label}
+		</button>
 	);
 }
 
@@ -2159,25 +2794,25 @@ function ToggleSettingRow({
 	onToggle: () => void;
 }) {
 	return (
-		<div className="flex items-start justify-between gap-4">
-			<div>
-				<p className="text-sm font-semibold text-foreground">{label}</p>
-				<p className="mt-1 text-xs leading-5 text-text-muted">
+		<div className="flex items-center justify-between gap-4">
+			<div className="min-w-0 pr-3">
+				<p className="text-sm font-medium text-foreground">{label}</p>
+				<p className="mt-0.5 text-[12px] leading-5 text-text-muted">
 					{description}
 				</p>
 			</div>
 			<button
 				aria-pressed={enabled}
 				className={cn(
-					"relative mt-1 flex h-7 w-12 shrink-0 rounded-full p-1 transition",
-					enabled ? "bg-accent" : "bg-[#d9dfd8]",
+					"pressable relative flex h-6 w-11 shrink-0 rounded-full p-0.5 transition",
+					enabled ? "bg-accent" : "bg-[#d7ddd7]",
 				)}
 				onClick={onToggle}
 				type="button"
 			>
 				<span
 					className={cn(
-						"h-5 w-5 rounded-full bg-white shadow-[0_2px_6px_rgba(17,24,28,0.12)] transition",
+						"h-5 w-5 rounded-full bg-white shadow-[0_1px_3px_rgba(17,24,28,0.12)] transition",
 						enabled ? "translate-x-5" : "translate-x-0",
 					)}
 				/>
@@ -2186,23 +2821,50 @@ function ToggleSettingRow({
 	);
 }
 
+function ChoiceSettingRow({
+	children,
+	description,
+	label,
+}: {
+	children: React.ReactNode;
+	description: string;
+	label: string;
+}) {
+	return (
+		<div className="space-y-2">
+			<div className="flex items-center justify-between gap-4">
+				<p className="text-sm font-medium text-foreground">{label}</p>
+				<p className="shrink-0 text-[12px] text-text-muted">
+					{description}
+				</p>
+			</div>
+			<div className="grid grid-flow-col auto-cols-fr gap-1">
+				{children}
+			</div>
+		</div>
+	);
+}
+
 function ChoiceChip({
 	active,
+	disabled,
 	label,
 	onClick,
 }: {
 	active: boolean;
+	disabled?: boolean;
 	label: string;
 	onClick: () => void;
 }) {
 	return (
 		<button
 			className={cn(
-				"rounded-[0.9rem] px-3 py-2 text-sm font-semibold transition",
+				"pressable flex min-h-8 w-full min-w-0 items-center justify-center rounded-[0.7rem] px-2 py-1.5 text-center text-[12px] font-medium transition disabled:pointer-events-none disabled:opacity-55",
 				active
-					? "bg-white text-foreground shadow-[0_2px_8px_rgba(17,24,28,0.05)]"
+					? "bg-surface-muted text-foreground"
 					: "bg-transparent text-text-muted",
 			)}
+			disabled={disabled}
 			onClick={onClick}
 			type="button"
 		>
