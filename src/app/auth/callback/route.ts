@@ -2,6 +2,7 @@ import { createServerClient } from "@supabase/ssr";
 import { cookies } from "next/headers";
 import { NextResponse } from "next/server";
 
+import { getDictionary, LOCALE_COOKIE, normalizeLocale } from "@/lib/locale";
 import { getSupabaseEnv } from "@/lib/supabase/env";
 
 export async function GET(request: Request) {
@@ -10,6 +11,8 @@ export async function GET(request: Request) {
   const next = url.searchParams.get("next") ?? "/";
   const { url: supabaseUrl, anonKey, dbSchema } = getSupabaseEnv();
   const cookieStore = await cookies();
+  const locale = normalizeLocale(cookieStore.get(LOCALE_COOKIE)?.value);
+  const t = getDictionary(locale);
   const successResponse = NextResponse.redirect(new URL(next, request.url));
 
   if (code) {
@@ -33,7 +36,7 @@ export async function GET(request: Request) {
 
     if (exchangeError) {
       return NextResponse.redirect(
-        new URL(`/login?status=error&message=${encodeURIComponent(exchangeError.message)}`, request.url),
+        new URL(`/login?status=error&message=${encodeURIComponent(t.googleStartFailed)}`, request.url),
       );
     }
 
@@ -42,7 +45,7 @@ export async function GET(request: Request) {
     if (setupError) {
       return NextResponse.redirect(
         new URL(
-          `/login?status=error&message=${encodeURIComponent("Account setup failed. Run the TaskOrbit schema SQL and expose the task_orbit schema in Supabase API settings.")}`,
+          `/login?status=error&message=${encodeURIComponent(t.loginSetupFailed)}`,
           request.url,
         ),
       );

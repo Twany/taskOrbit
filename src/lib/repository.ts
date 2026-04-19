@@ -1,7 +1,6 @@
 import "server-only";
 
 import type { DashboardData, Project, RepeatType, Task } from "./types";
-import { buildDemoDashboardData } from "./demo-data";
 import { hasSupabaseEnv } from "./supabase/env";
 import { createSupabaseServerClient } from "./supabase/server";
 
@@ -150,7 +149,16 @@ async function ensureTodayRecurringTasks(
 
 export async function getDashboardData(): Promise<DashboardData> {
 	if (!hasSupabaseEnv()) {
-		return buildDemoDashboardData();
+		return {
+			viewer: {
+				label: "You",
+				isAuthenticated: false,
+			},
+			projects: [],
+			tasks: [],
+			appIssue: "config-missing",
+			generatedAt: new Date().toISOString(),
+		};
 	}
 
 	const supabase = await createSupabaseServerClient();
@@ -159,12 +167,16 @@ export async function getDashboardData(): Promise<DashboardData> {
 	} = await supabase.auth.getUser();
 
 	if (!user) {
-		return buildDemoDashboardData({
+		return {
 			viewer: {
 				label: "You",
-				cloudSyncConfigured: true,
+				isAuthenticated: false,
 			},
-		});
+			projects: [],
+			tasks: [],
+			appIssue: null,
+			generatedAt: new Date().toISOString(),
+		};
 	}
 
 	const { data: templateRows, error: templatesError } = await supabase
@@ -201,17 +213,15 @@ export async function getDashboardData(): Promise<DashboardData> {
 		tasksResult.error ||
 		allTemplatesResult.error
 	) {
-		return {
-			viewer: {
-				label: user.email?.split("@")[0] ?? "You",
-				email: user.email,
-				isAuthenticated: true,
-				cloudSyncConfigured: true,
-			},
-			source: "supabase",
-			projects: [],
-			tasks: [],
-			syncIssue: "load-failed",
+			return {
+				viewer: {
+					label: user.email?.split("@")[0] ?? "You",
+					email: user.email,
+					isAuthenticated: true,
+				},
+				projects: [],
+				tasks: [],
+				appIssue: "load-failed",
 			generatedAt: new Date().toISOString(),
 		};
 	}
@@ -228,14 +238,12 @@ export async function getDashboardData(): Promise<DashboardData> {
 			label: user.user_metadata.full_name ?? user.email?.split("@")[0] ?? "You",
 			email: user.email,
 			isAuthenticated: true,
-			cloudSyncConfigured: true,
 		},
-		source: "supabase",
 		projects: (projectsResult.data ?? []).map(mapProject),
 		tasks: (tasksResult.data ?? []).map((task) =>
 			mapTask(task, task.template_id ? repeatByTemplateId.get(task.template_id) ?? null : null),
 		),
-		syncIssue: null,
+		appIssue: null,
 		generatedAt: new Date().toISOString(),
 	};
 }

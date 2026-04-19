@@ -35,7 +35,7 @@ export async function requestEmailCode(formData: FormData) {
   });
 
   if (error) {
-    redirect(`/login?status=error&message=${encodeURIComponent(error.message)}`);
+    redirect(`/login?status=error&message=${encodeURIComponent(t.sendFailed)}`);
   }
 
   redirect(
@@ -76,7 +76,7 @@ export async function verifyEmailCode(formData: FormData) {
   if (verifyError) {
     redirect(
       `/login?status=error&email=${encodeURIComponent(email)}&message=${encodeURIComponent(
-        verifyError.message,
+        t.verifyFailed,
       )}`,
     );
   }

@@ -84,6 +84,7 @@ export default async function TaskDetailPage({
             <DetailRow
               icon={<CalendarDays className="h-4 w-4" />}
               label={t.detailRepeat}
+              last
               value={
                 task.repeatType === "daily"
                   ? t.daily
@@ -109,19 +110,24 @@ export default async function TaskDetailPage({
 function DetailRow({
   icon,
   label,
+  last = false,
   value,
 }: {
   icon: React.ReactNode;
   label: string;
+  last?: boolean;
   value: string;
 }) {
   return (
-    <div className="flex items-center justify-between gap-4 border-b border-surface-soft px-4 py-4 last:border-b-0">
-      <div className="flex items-center gap-3">
-        <span className="text-text-muted">{icon}</span>
-        <span className="text-sm font-medium text-foreground">{label}</span>
+    <div className="px-4">
+      <div className="flex items-center justify-between gap-4 py-4">
+        <div className="flex items-center gap-3">
+          <span className="text-text-muted">{icon}</span>
+          <span className="text-sm font-medium text-foreground">{label}</span>
+        </div>
+        <span className="text-sm text-text-muted">{value}</span>
       </div>
-      <span className="text-sm text-text-muted">{value}</span>
+      {!last ? <div className="h-px bg-surface-soft" /> : null}
     </div>
   );
 }

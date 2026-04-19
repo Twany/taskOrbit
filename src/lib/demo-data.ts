@@ -154,21 +154,18 @@ export function getDemoTasks(referenceDate = new Date()): Task[] {
 
 export function buildDemoDashboardData(options?: {
   viewer?: Partial<Viewer>;
-  source?: DashboardData["source"];
 }): DashboardData {
   const viewer: Viewer = {
     label: options?.viewer?.label ?? "You",
     email: options?.viewer?.email,
     isAuthenticated: options?.viewer?.isAuthenticated ?? false,
-    cloudSyncConfigured: options?.viewer?.cloudSyncConfigured ?? false,
   };
 
   return {
     viewer,
-    source: options?.source ?? "demo",
     projects: getDemoProjects(),
     tasks: getDemoTasks(),
-    syncIssue: null,
+    appIssue: null,
     generatedAt: new Date().toISOString(),
   };
 }

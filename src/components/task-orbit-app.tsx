@@ -281,11 +281,7 @@ export function TaskOrbitApp({
 	const [projectSheetOpen, setProjectSheetOpen] = useState(false);
 	const [resumeComposerAfterProjectSheet, setResumeComposerAfterProjectSheet] =
 		useState(false);
-	const [statusMessage, setStatusMessage] = useState<string | null>(
-		initialData.syncIssue === "load-failed"
-			? getDictionary(initialLocale).syncLoadFailed
-			: null,
-	);
+	const [statusMessage, setStatusMessage] = useState<string | null>(null);
 	const [showReminder, setShowReminder] = useState(
 		readStoredPreferences().openReminderEnabled,
 	);
@@ -376,8 +372,25 @@ export function TaskOrbitApp({
 		};
 	}, [statusMessage]);
 
-	const canSyncToCloud =
-		initialData.viewer.cloudSyncConfigured && initialData.viewer.isAuthenticated;
+	function requireWriteAccess(authMessage: string) {
+		if (initialData.appIssue === "config-missing") {
+			setStatusMessage(t.appUnavailableHint);
+			return false;
+		}
+
+		if (!initialData.viewer.isAuthenticated) {
+			setStatusMessage(authMessage);
+			handleAuthRoute();
+			return false;
+		}
+
+		if (initialData.appIssue === "load-failed") {
+			setStatusMessage(t.loadFailedHint);
+			return false;
+		}
+
+		return true;
+	}
 
 	async function handleLocaleChange(nextLocale: AppLocale) {
 		setLocale(nextLocale);
@@ -416,6 +429,15 @@ export function TaskOrbitApp({
 	function openTaskComposer(
 		bucket: ComposerState["bucket"] = preferences.defaultTaskBucket,
 	) {
+		if (!requireWriteAccess(t.taskCreateAuth)) {
+			return;
+		}
+
+		if (projects.length === 0) {
+			openCreateProject();
+			return;
+		}
+
 		setComposer({
 			title: "",
 			projectId: getPreferredProjectId(composer.projectId),
@@ -514,6 +536,10 @@ export function TaskOrbitApp({
 		taskId: string,
 		bucket: NonNullable<TaskMutationPayload["bucket"]>,
 	) {
+		if (!requireWriteAccess(t.taskCreateAuth)) {
+			return;
+		}
+
 		const previousTasks = tasks;
 		const patch = buildTaskPatch(bucket);
 
@@ -522,11 +548,6 @@ export function TaskOrbitApp({
 		setTasks((current) =>
 			current.map((task) => (task.id === taskId ? {...task, ...patch} : task)),
 		);
-
-		if (!canSyncToCloud) {
-			setMovingTaskId(null);
-			return;
-		}
 
 		try {
 			const syncedTask = await persistTaskUpdate(taskId, {bucket});
@@ -547,6 +568,10 @@ export function TaskOrbitApp({
 		taskId: string,
 		action: "skip-today" | "pause-repeat",
 	) {
+		if (!requireWriteAccess(t.taskCreateAuth)) {
+			return;
+		}
+
 		const previousTasks = tasks;
 
 		setStatusMessage(null);
@@ -560,11 +585,6 @@ export function TaskOrbitApp({
 					task.id === taskId ? {...task, repeatType: null, templateId: null} : task,
 				),
 			);
-		}
-
-		if (!canSyncToCloud) {
-			setMovingTaskId(null);
-			return;
 		}
 
 		try {
@@ -592,6 +612,10 @@ export function TaskOrbitApp({
 
 	async function handleTaskCreate() {
 		if (!composer.title.trim() || !composer.projectId) {
+			return;
+		}
+
+		if (!requireWriteAccess(t.taskCreateAuth)) {
 			return;
 		}
 
@@ -630,11 +654,6 @@ export function TaskOrbitApp({
 			repeatType: "none",
 		});
 
-		if (!canSyncToCloud) {
-			setIsTaskSaving(false);
-			return;
-		}
-
 		try {
 			const syncedTask = await persistTaskCreate(composer);
 			setTasks((current) =>
@@ -655,6 +674,10 @@ export function TaskOrbitApp({
 	}
 
 	function openCreateProject() {
+		if (!requireWriteAccess(t.projectCreateAuth)) {
+			return;
+		}
+
 		setProjectEditor(createProjectEditor());
 		setResumeComposerAfterProjectSheet(false);
 		setProjectSheetOpen(true);
@@ -722,11 +745,6 @@ export function TaskOrbitApp({
 				),
 			);
 
-			if (!canSyncToCloud) {
-				setIsProjectSaving(false);
-				return;
-			}
-
 			try {
 				const syncedProject = await persistProjectUpdate(projectId, {
 					...projectEditor,
@@ -773,11 +791,6 @@ export function TaskOrbitApp({
 			setResumeComposerAfterProjectSheet(false);
 		}
 
-		if (!canSyncToCloud) {
-			setIsProjectSaving(false);
-			return;
-		}
-
 		try {
 			const syncedProject = await persistProjectCreate({
 				...projectEditor,
@@ -818,6 +831,10 @@ export function TaskOrbitApp({
 			return;
 		}
 
+		if (!requireWriteAccess(t.projectCreateAuth)) {
+			return;
+		}
+
 		const deletingProjectId = projectEditor.id;
 
 		if (projects.length <= 1) {
@@ -855,11 +872,6 @@ export function TaskOrbitApp({
 
 		if (activeProjectId === deletingProjectId) {
 			setActiveProjectId(PROJECT_ALL_ID);
-		}
-
-		if (!canSyncToCloud) {
-			setIsProjectDeleting(false);
-			return;
 		}
 
 		try {
@@ -941,7 +953,14 @@ export function TaskOrbitApp({
 					)}
 					style={{ overscrollBehaviorY: "contain" }}
 				>
-					{activeScreen === "tasks" ? (
+					{initialData.appIssue && activeScreen !== "settings" ? (
+						<AppIssueState
+							issue={initialData.appIssue}
+							locale={locale}
+						/>
+					) : null}
+
+					{!initialData.appIssue && activeScreen === "tasks" ? (
 						<TasksScreen
 							groupedTasks={groupedTasks}
 							locale={locale}
@@ -966,7 +985,7 @@ export function TaskOrbitApp({
 						/>
 					) : null}
 
-					{activeScreen === "projects" ? (
+					{!initialData.appIssue && activeScreen === "projects" ? (
 						<ProjectsScreen
 							locale={locale}
 							onCreateProject={openCreateProject}
@@ -979,7 +998,7 @@ export function TaskOrbitApp({
 						/>
 					) : null}
 
-					{activeScreen === "review" ? (
+					{!initialData.appIssue && activeScreen === "review" ? (
 						<ReviewScreen
 							groupedTasks={groupedAllTasks}
 							locale={locale}
@@ -1027,7 +1046,6 @@ export function TaskOrbitApp({
 							onLocaleChange={handleLocaleChange}
 							preferences={preferences}
 							viewer={initialData.viewer}
-							source={initialData.source}
 						/>
 					) : null}
 				</section>
@@ -2053,9 +2071,11 @@ function ProjectsScreen({
 
 			<div className="flex items-center justify-between">
 				<div>
-					<p className="text-sm font-semibold text-foreground">Project List</p>
+					<p className="text-sm font-semibold text-foreground">
+						{t.projectList}
+					</p>
 					<p className="mt-1 text-[12px] text-text-muted">
-						{t.limitCount(preferredTodayLimit)}
+						{t.projectListHint(activeProjects, pausedProjects)}
 					</p>
 				</div>
 				<button
@@ -2393,7 +2413,6 @@ function SettingsScreen({
 	onTodayLimitChange,
 	preferences,
 	viewer,
-	source,
 }: {
 	isAuthRouting: boolean;
 	isLocaleSaving: boolean;
@@ -2406,33 +2425,26 @@ function SettingsScreen({
 	onTodayLimitChange: (limit: (typeof TODAY_LIMIT_OPTIONS)[number]) => void;
 	preferences: AppPreferences;
 	viewer: DashboardData["viewer"];
-	source: DashboardData["source"];
 }) {
 	const t = getDictionary(locale);
 	return (
 		<div className="space-y-6">
 			<section className="space-y-3">
-				<div>
-					<h1 className="text-lg font-semibold tracking-[-0.04em] text-foreground">
-						{t.account}
-					</h1>
-					<p className="mt-1 text-sm text-text-muted">
-						{viewer.isAuthenticated ? viewer.label : t.sync}
-					</p>
-					<p className="mt-1 text-sm leading-6 text-text-muted">
-						{viewer.isAuthenticated
-							? viewer.email
-							: t.settingsSyncHint}
-					</p>
-				</div>
 				<div className="overflow-hidden rounded-[1rem] bg-surface">
-					<div className="flex items-center justify-between px-4 py-4">
+					<div className="flex items-end justify-between gap-4 px-4 py-4">
 						<div>
-							<p className="text-sm font-semibold text-foreground">
-								{t.sync}
+							<p className="text-lg font-semibold tracking-[-0.04em] text-foreground">
+								{t.account}
 							</p>
-							<p className="mt-1 text-xs text-text-muted">
-								{source === "supabase" ? t.cloud : t.demo}
+							<p className="mt-2 text-sm font-medium text-foreground">
+								{viewer.isAuthenticated
+									? viewer.label
+									: t.accountSignedOut}
+							</p>
+							<p className="mt-1 text-sm leading-6 text-text-muted">
+								{viewer.isAuthenticated
+									? viewer.email
+									: t.settingsSyncHint}
 							</p>
 						</div>
 						<button
@@ -2568,6 +2580,38 @@ function SettingsScreen({
 					</div>
 				</div>
 			</section>
+		</div>
+	);
+}
+
+function AppIssueState({
+	issue,
+	locale,
+}: {
+	issue: NonNullable<DashboardData["appIssue"]>;
+	locale: AppLocale;
+}) {
+	const t = getDictionary(locale);
+	const title =
+		issue === "config-missing" ? t.appUnavailable : t.loadFailed;
+	const hint =
+		issue === "config-missing" ? t.appUnavailableHint : t.loadFailedHint;
+
+	return (
+		<div className="flex min-h-full items-center justify-center py-12">
+			<div className="w-full max-w-sm text-center">
+				<p className="text-lg font-semibold tracking-[-0.04em] text-foreground">
+					{title}
+				</p>
+				<p className="mt-2 text-sm leading-6 text-text-muted">{hint}</p>
+				<button
+					className="pressable mt-5 inline-flex items-center rounded-[0.9rem] bg-accent px-4 py-2.5 text-sm font-semibold text-white"
+					onClick={() => window.location.reload()}
+					type="button"
+				>
+					{t.reload}
+				</button>
+			</div>
 		</div>
 	);
 }

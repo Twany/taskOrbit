@@ -5,13 +5,11 @@ export type TaskBucket = "overdue" | "today" | "tomorrow" | "backlog" | "done";
 export type RepeatType = "none" | "daily" | "weekdays";
 export type AppScreen = "tasks" | "projects" | "review" | "settings";
 export type TaskFilter = "all" | "my-day" | "my-week";
-export type DataSource = "demo" | "supabase";
 
 export interface Viewer {
   label: string;
   email?: string;
   isAuthenticated: boolean;
-  cloudSyncConfigured: boolean;
 }
 
 export interface Project {
@@ -41,9 +39,8 @@ export interface Task {
 
 export interface DashboardData {
   viewer: Viewer;
-  source: DataSource;
   projects: Project[];
   tasks: Task[];
-  syncIssue?: "load-failed" | null;
+  appIssue?: "config-missing" | "load-failed" | null;
   generatedAt: string;
 }

@@ -104,11 +104,6 @@ export default async function LoginPage({
             </FormSubmitButton>
           </form>
         ) : null}
-
-        <p className="mt-6 text-sm leading-6 text-text-muted">
-          {t.keysHint} <code className="font-mono text-foreground">.env.local</code>. {t.schemaHint}{" "}
-          <code className="font-mono text-foreground">supabase/schema.sql</code>.
-        </p>
       </section>
     </main>
   );
