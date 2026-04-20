@@ -51,7 +51,7 @@ export default async function LoginPage({
         <form action={signInWithGoogle} className="mt-6">
           <FormSubmitButton
             className="pressable flex w-full items-center justify-center gap-2 rounded-[0.9rem] bg-surface-soft px-4 py-4 text-base font-semibold text-foreground"
-            pendingLabel={t.opening}
+            pendingLabel={t.signingIn}
           >
             {t.google}
             <ArrowRight className="h-4 w-4" />

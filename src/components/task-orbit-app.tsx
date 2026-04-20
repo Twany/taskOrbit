@@ -1657,14 +1657,7 @@ function TasksScreen({
 				: todayCount > preferredTodayLimit
 					? t.todayMessageOver(todayCount - preferredTodayLimit)
 					: t.todayMessageLeft(slotsRemaining);
-	const defaultBucket = (
-		overdueCount > 0
-			? "overdue"
-			: todayCount > 0
-				? "today"
-				: (sections.find((bucket) => groupedTasks[bucket].length > 0) ??
-					sections[0])
-	) as TaskBucket;
+	const defaultBucket = (overdueCount > 0 ? "overdue" : "today") as TaskBucket;
 	const loopedSections = useMemo(
 		() => [sections[sections.length - 1], ...sections, sections[0]],
 		[sections],
@@ -2692,7 +2685,7 @@ function SettingsScreen({
 		<div className="space-y-6">
 			<section className="space-y-3">
 				<div className="overflow-hidden rounded-[1rem] bg-surface">
-					<div className="flex items-end justify-between gap-4 px-4 py-4">
+					<div className="flex items-start justify-between gap-4 px-4 py-4">
 						<div>
 							<p className="text-lg font-semibold tracking-[-0.04em] text-foreground">
 								{t.account}
@@ -2708,19 +2701,27 @@ function SettingsScreen({
 									: t.settingsSyncHint}
 							</p>
 						</div>
-						<button
-							aria-busy={isAuthRouting}
-							className="pressable inline-flex items-center rounded-[0.9rem] bg-accent px-4 py-2.5 text-sm font-semibold text-white disabled:pointer-events-none disabled:opacity-60"
-							disabled={isAuthRouting}
-							onClick={onAuthRoute}
-							type="button"
-						>
-							{isAuthRouting
-								? t.opening
-								: viewer.isAuthenticated
-									? t.signOut
-									: t.signIn}
-						</button>
+						{viewer.isAuthenticated ? (
+							<button
+								aria-busy={isAuthRouting}
+								className="pressable inline-flex items-center rounded-[0.9rem] px-2 py-2 text-sm font-medium text-text-muted disabled:pointer-events-none disabled:opacity-60"
+								disabled={isAuthRouting}
+								onClick={onAuthRoute}
+								type="button"
+							>
+								{isAuthRouting ? t.signingOut : t.signOut}
+							</button>
+						) : (
+							<button
+								aria-busy={isAuthRouting}
+								className="pressable inline-flex items-center rounded-[0.9rem] bg-accent px-4 py-2.5 text-sm font-semibold text-white disabled:pointer-events-none disabled:opacity-60"
+								disabled={isAuthRouting}
+								onClick={onAuthRoute}
+								type="button"
+							>
+								{isAuthRouting ? t.signingIn : t.signIn}
+							</button>
+						)}
 					</div>
 				</div>
 			</section>
