@@ -36,6 +36,7 @@ import {
 	groupTasks,
 } from "@/lib/task-groups";
 import {
+	formatWeekdayLabel,
 	formatLocaleDate,
 	formatLocaleDateTime,
 	formatLocaleWeekday,
@@ -50,11 +51,13 @@ import type {
 	Task,
 	TaskBucket,
 	TaskPriority,
+	WeeklyRepeatWeekday,
 } from "@/lib/types";
 import {cn} from "@/lib/utils";
 
 type ComposerState = {
 	title: string;
+	note: string;
 	projectId: string;
 	bucket: Extract<TaskBucket, "backlog" | "today" | "tomorrow">;
 	priority: TaskPriority;
@@ -64,6 +67,13 @@ type ComposerState = {
 type TaskMutationPayload = {
 	bucket?: Extract<TaskBucket, "backlog" | "today" | "tomorrow" | "done">;
 	action?: "skip-today" | "pause-repeat";
+	detail?: string;
+};
+
+type TaskActionPromptState = {
+	taskId: string;
+	kind: "done" | "skip" | "pause";
+	mutation: TaskMutationPayload;
 };
 
 const PROJECT_ALL_ID = "all-projects";
@@ -83,12 +93,14 @@ const PROJECT_ICON_OPTIONS: Project["icon"][] = [
 	"book",
 ];
 const TODAY_LIMIT_OPTIONS = [3, 5, 7] as const;
+const WEEKLY_REPEAT_WEEKDAY_OPTIONS = [1, 2, 3, 4, 5, 6, 0] as const;
 
 type AppPreferences = {
 	openReminderEnabled: boolean;
 	defaultTaskBucket: ComposerState["bucket"];
 	preferredTodayLimit: (typeof TODAY_LIMIT_OPTIONS)[number];
 	showDoneColumn: boolean;
+	weeklyRepeatWeekday: WeeklyRepeatWeekday;
 };
 
 const DEFAULT_PREFERENCES: AppPreferences = {
@@ -96,17 +108,26 @@ const DEFAULT_PREFERENCES: AppPreferences = {
 	defaultTaskBucket: "backlog",
 	preferredTodayLimit: 5,
 	showDoneColumn: true,
+	weeklyRepeatWeekday: 5,
 };
 
-function readStoredPreferences() {
+function readStoredPreferences(
+	serverWeeklyRepeatWeekday: WeeklyRepeatWeekday = 5,
+) {
 	if (typeof window === "undefined") {
-		return DEFAULT_PREFERENCES;
+		return {
+			...DEFAULT_PREFERENCES,
+			weeklyRepeatWeekday: serverWeeklyRepeatWeekday,
+		};
 	}
 
 	const savedPreferences = window.localStorage.getItem(APP_PREFERENCES_KEY);
 
 	if (!savedPreferences) {
-		return DEFAULT_PREFERENCES;
+		return {
+			...DEFAULT_PREFERENCES,
+			weeklyRepeatWeekday: serverWeeklyRepeatWeekday,
+		};
 	}
 
 	try {
@@ -126,10 +147,19 @@ function readStoredPreferences() {
 					: DEFAULT_PREFERENCES.preferredTodayLimit,
 			showDoneColumn:
 				parsed.showDoneColumn ?? DEFAULT_PREFERENCES.showDoneColumn,
+			weeklyRepeatWeekday:
+				typeof parsed.weeklyRepeatWeekday === "number" &&
+				parsed.weeklyRepeatWeekday >= 0 &&
+				parsed.weeklyRepeatWeekday <= 6
+					? (parsed.weeklyRepeatWeekday as WeeklyRepeatWeekday)
+					: serverWeeklyRepeatWeekday,
 		} satisfies AppPreferences;
 	} catch {
 		window.localStorage.removeItem(APP_PREFERENCES_KEY);
-		return DEFAULT_PREFERENCES;
+		return {
+			...DEFAULT_PREFERENCES,
+			weeklyRepeatWeekday: serverWeeklyRepeatWeekday,
+		};
 	}
 }
 
@@ -272,7 +302,7 @@ export function TaskOrbitApp({
 	const [tasks, setTasks] = useState(initialData.tasks);
 	const [locale, setLocale] = useState<AppLocale>(initialLocale);
 	const [preferences, setPreferences] = useState<AppPreferences>(
-		readStoredPreferences,
+		() => readStoredPreferences(initialData.weeklyRepeatWeekday),
 	);
 	const [activeScreen, setActiveScreen] = useState<AppScreen>("tasks");
 	const [activeProjectId, setActiveProjectId] = useState(PROJECT_ALL_ID);
@@ -283,16 +313,20 @@ export function TaskOrbitApp({
 		useState(false);
 	const [statusMessage, setStatusMessage] = useState<string | null>(null);
 	const [showReminder, setShowReminder] = useState(
-		readStoredPreferences().openReminderEnabled,
+		readStoredPreferences(initialData.weeklyRepeatWeekday).openReminderEnabled,
 	);
 	const [isTaskSaving, setIsTaskSaving] = useState(false);
 	const [movingTaskId, setMovingTaskId] = useState<string | null>(null);
+	const [taskActionPrompt, setTaskActionPrompt] =
+		useState<TaskActionPromptState | null>(null);
 	const [isProjectSaving, setIsProjectSaving] = useState(false);
 	const [isProjectDeleting, setIsProjectDeleting] = useState(false);
 	const [isLocaleSaving, setIsLocaleSaving] = useState(false);
+	const [isWeeklyRepeatDaySaving, setIsWeeklyRepeatDaySaving] = useState(false);
 	const [isAuthRouting, setIsAuthRouting] = useState(false);
 	const [composer, setComposer] = useState<ComposerState>({
 		title: "",
+		note: "",
 		projectId: initialData.projects[0]?.id ?? "",
 		bucket: "backlog",
 		priority: "medium",
@@ -408,6 +442,22 @@ export function TaskOrbitApp({
 		}
 	}
 
+	async function persistWeeklyRepeatWeekday(
+		weeklyRepeatWeekday: WeeklyRepeatWeekday,
+	) {
+		const response = await fetch("/api/preferences", {
+			method: "PATCH",
+			headers: {
+				"Content-Type": "application/json",
+			},
+			body: JSON.stringify({weeklyRepeatWeekday}),
+		});
+
+		if (!response.ok) {
+			await readMutationError(response, "Unable to save preference");
+		}
+	}
+
 	function getPreferredProjectId(fallbackProjectId?: string) {
 		if (
 			activeProjectId !== PROJECT_ALL_ID &&
@@ -440,6 +490,7 @@ export function TaskOrbitApp({
 
 		setComposer({
 			title: "",
+			note: "",
 			projectId: getPreferredProjectId(composer.projectId),
 			bucket,
 			priority: "medium",
@@ -535,6 +586,7 @@ export function TaskOrbitApp({
 	async function handleTaskMove(
 		taskId: string,
 		bucket: NonNullable<TaskMutationPayload["bucket"]>,
+		detail?: string,
 	) {
 		if (!requireWriteAccess(t.taskCreateAuth)) {
 			return;
@@ -550,7 +602,7 @@ export function TaskOrbitApp({
 		);
 
 		try {
-			const syncedTask = await persistTaskUpdate(taskId, {bucket});
+			const syncedTask = await persistTaskUpdate(taskId, {bucket, detail});
 			setTasks((current) =>
 				current.map((task) => (task.id === taskId ? syncedTask : task)),
 			);
@@ -567,6 +619,7 @@ export function TaskOrbitApp({
 	async function handleRecurringTaskAction(
 		taskId: string,
 		action: "skip-today" | "pause-repeat",
+		detail?: string,
 	) {
 		if (!requireWriteAccess(t.taskCreateAuth)) {
 			return;
@@ -588,7 +641,7 @@ export function TaskOrbitApp({
 		}
 
 		try {
-			const syncedTask = await persistTaskUpdate(taskId, {action});
+			const syncedTask = await persistTaskUpdate(taskId, {action, detail});
 			if (action === "skip-today") {
 				setTasks((current) => current.filter((task) => task.id !== taskId));
 			} else {
@@ -610,6 +663,48 @@ export function TaskOrbitApp({
 		}
 	}
 
+	function openTaskActionPrompt(
+		taskId: string,
+		kind: TaskActionPromptState["kind"],
+		mutation: TaskActionPromptState["mutation"],
+	) {
+		if (!requireWriteAccess(t.taskCreateAuth)) {
+			return;
+		}
+
+		setTaskActionPrompt({
+			taskId,
+			kind,
+			mutation,
+		});
+	}
+
+	async function handleTaskActionPromptSubmit(detail: string) {
+		if (!taskActionPrompt) {
+			return;
+		}
+
+		const currentPrompt = taskActionPrompt;
+		setTaskActionPrompt(null);
+
+		if (currentPrompt.mutation.action) {
+			await handleRecurringTaskAction(
+				currentPrompt.taskId,
+				currentPrompt.mutation.action,
+				detail,
+			);
+			return;
+		}
+
+		if (currentPrompt.mutation.bucket) {
+			await handleTaskMove(
+				currentPrompt.taskId,
+				currentPrompt.mutation.bucket,
+				detail,
+			);
+		}
+	}
+
 	async function handleTaskCreate() {
 		if (!composer.title.trim() || !composer.projectId) {
 			return;
@@ -627,7 +722,7 @@ export function TaskOrbitApp({
 					? null
 					: `local-template-${crypto.randomUUID()}`,
 			title: composer.title.trim(),
-			note: "",
+			note: composer.note.trim() || undefined,
 			priority: composer.priority,
 			taskDate:
 				composer.repeatType === "none"
@@ -648,6 +743,7 @@ export function TaskOrbitApp({
 		setTasks((current) => [optimisticTask, ...current]);
 		setComposer({
 			title: "",
+			note: "",
 			projectId: getPreferredProjectId(composer.projectId),
 			bucket: preferences.defaultTaskBucket,
 			priority: "medium",
@@ -710,6 +806,40 @@ export function TaskOrbitApp({
 		window.location.assign(
 			initialData.viewer.isAuthenticated ? "/auth/sign-out" : "/login",
 		);
+	}
+
+	async function handleWeeklyRepeatWeekdayChange(
+		weeklyRepeatWeekday: WeeklyRepeatWeekday,
+	) {
+		if (!requireWriteAccess(t.taskCreateAuth)) {
+			return;
+		}
+
+		const previousWeekday = preferences.weeklyRepeatWeekday;
+		setStatusMessage(null);
+		setIsWeeklyRepeatDaySaving(true);
+		setPreferences((current) => ({
+			...current,
+			weeklyRepeatWeekday,
+		}));
+
+		try {
+			await persistWeeklyRepeatWeekday(weeklyRepeatWeekday);
+		} catch (error) {
+			setPreferences((current) => ({
+				...current,
+				weeklyRepeatWeekday: previousWeekday,
+			}));
+			setStatusMessage(
+				resolveMutationMessage(
+					error,
+					t.taskCreateAuth,
+					t.cloudSyncFailed,
+				),
+			);
+		} finally {
+			setIsWeeklyRepeatDaySaving(false);
+		}
 	}
 
 	async function handleProjectSave() {
@@ -965,7 +1095,7 @@ export function TaskOrbitApp({
 							groupedTasks={groupedTasks}
 							locale={locale}
 							movingTaskId={movingTaskId}
-							onRecurringAction={handleRecurringTaskAction}
+							onRequestAction={openTaskActionPrompt}
 							onQuickAdd={(bucket) =>
 								openTaskComposer(
 									bucket === "today" ||
@@ -1015,6 +1145,7 @@ export function TaskOrbitApp({
 						<SettingsScreen
 							isAuthRouting={isAuthRouting}
 							isLocaleSaving={isLocaleSaving}
+							isWeeklyRepeatDaySaving={isWeeklyRepeatDaySaving}
 							onAuthRoute={handleAuthRoute}
 							locale={locale}
 							onDefaultBucketChange={(defaultTaskBucket) =>
@@ -1044,6 +1175,9 @@ export function TaskOrbitApp({
 								}))
 							}
 							onLocaleChange={handleLocaleChange}
+							onWeeklyRepeatWeekdayChange={
+								handleWeeklyRepeatWeekdayChange
+							}
 							preferences={preferences}
 							viewer={initialData.viewer}
 						/>
@@ -1131,6 +1265,23 @@ export function TaskOrbitApp({
 									/>
 								</label>
 
+								<label className="block">
+									<span className="mb-2 block text-sm font-semibold text-foreground">
+										{t.note}
+									</span>
+									<textarea
+										className="min-h-24 w-full resize-none rounded-[1rem] bg-surface-soft px-4 py-4 text-sm text-foreground outline-none transition focus:bg-[#eef4ef]"
+										onChange={(event) =>
+											setComposer((current) => ({
+												...current,
+												note: event.target.value,
+											}))
+										}
+										placeholder={t.notePlaceholder}
+										value={composer.note}
+									/>
+								</label>
+
 								<div className="grid grid-cols-2 gap-4">
 									<label className="block">
 										<span className="mb-2 block text-sm font-semibold text-foreground">
@@ -1206,7 +1357,7 @@ export function TaskOrbitApp({
 										{([
 											["none", t.none],
 											["daily", t.daily],
-											["weekdays", t.weekdays],
+											["weekly", t.weekly],
 										] as const).map(([repeatType, label]) => (
 											<SegmentButton
 												key={repeatType}
@@ -1441,6 +1592,16 @@ export function TaskOrbitApp({
 						</div>
 					</div>
 				) : null}
+
+				{taskActionPrompt ? (
+					<TaskActionSheet
+						isSubmitting={movingTaskId === taskActionPrompt.taskId}
+						kind={taskActionPrompt.kind}
+						locale={locale}
+						onClose={() => setTaskActionPrompt(null)}
+						onSubmit={handleTaskActionPromptSubmit}
+					/>
+				) : null}
 			</div>
 		</main>
 	);
@@ -1450,7 +1611,7 @@ function TasksScreen({
 	groupedTasks,
 	locale,
 	movingTaskId,
-	onRecurringAction,
+	onRequestAction,
 	onQuickAdd,
 	onMoveTask,
 	preferredTodayLimit,
@@ -1461,14 +1622,16 @@ function TasksScreen({
 	groupedTasks: ReturnType<typeof groupTasks>;
 	locale: AppLocale;
 	movingTaskId: string | null;
-	onRecurringAction: (
+	onRequestAction: (
 		taskId: string,
-		action: "skip-today" | "pause-repeat",
+		kind: TaskActionPromptState["kind"],
+		mutation: TaskMutationPayload,
 	) => void;
 	onQuickAdd: (bucket: TaskBucket) => void;
 	onMoveTask: (
 		taskId: string,
 		bucket: NonNullable<TaskMutationPayload["bucket"]>,
+		detail?: string,
 	) => void;
 	preferredTodayLimit: number;
 	selectedTaskId: string | null;
@@ -1784,7 +1947,7 @@ function TasksScreen({
 								bucket={bucket}
 								locale={locale}
 								movingTaskId={movingTaskId}
-								onRecurringAction={onRecurringAction}
+								onRequestAction={onRequestAction}
 								onMoveTask={onMoveTask}
 								onQuickAdd={onQuickAdd}
 								selectedTaskId={selectedTaskId}
@@ -1803,7 +1966,7 @@ function TaskBucketCard({
 	bucket,
 	locale,
 	movingTaskId,
-	onRecurringAction,
+	onRequestAction,
 	onMoveTask,
 	onQuickAdd,
 	selectedTaskId,
@@ -1813,13 +1976,15 @@ function TaskBucketCard({
 	bucket: TaskBucket;
 	locale: AppLocale;
 	movingTaskId: string | null;
-	onRecurringAction: (
+	onRequestAction: (
 		taskId: string,
-		action: "skip-today" | "pause-repeat",
+		kind: TaskActionPromptState["kind"],
+		mutation: TaskMutationPayload,
 	) => void;
 	onMoveTask: (
 		taskId: string,
 		bucket: NonNullable<TaskMutationPayload["bucket"]>,
+		detail?: string,
 	) => void;
 	onQuickAdd: (bucket: TaskBucket) => void;
 	selectedTaskId: string | null;
@@ -1892,7 +2057,9 @@ function TaskBucketCard({
 													<span>{formatTaskMeta(task, locale)}</span>
 													{task.repeatType ? (
 														<span className="rounded-md bg-surface-soft px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-[0.08em] text-accent-strong">
-															{task.repeatType === "daily" ? t.daily : t.weekdays}
+															{task.repeatType === "daily"
+																? t.daily
+																: t.weekly}
 														</span>
 													) : null}
 												</span>
@@ -1920,10 +2087,9 @@ function TaskBucketCard({
 													pending={isMoving}
 													pendingLabel={t.moving}
 													onClick={() =>
-														onMoveTask(
-															task.id,
-															bucket === "done" ? "today" : "done",
-														)
+														bucket === "done"
+															? onMoveTask(task.id, "today")
+															: onRequestAction(task.id, "done", {bucket: "done"})
 													}
 												/>
 												<ActionButton
@@ -1933,7 +2099,9 @@ function TaskBucketCard({
 													pending={isMoving}
 													pendingLabel={t.moving}
 													onClick={() =>
-														onRecurringAction(task.id, "skip-today")
+														onRequestAction(task.id, "skip", {
+															action: "skip-today",
+														})
 													}
 												/>
 												<ActionButton
@@ -1943,7 +2111,9 @@ function TaskBucketCard({
 													pending={isMoving}
 													pendingLabel={t.moving}
 													onClick={() =>
-														onRecurringAction(task.id, "pause-repeat")
+														onRequestAction(task.id, "pause", {
+															action: "pause-repeat",
+														})
 													}
 												/>
 											</>
@@ -1972,10 +2142,9 @@ function TaskBucketCard({
 													pending={isMoving}
 													pendingLabel={t.moving}
 													onClick={() =>
-														onMoveTask(
-															task.id,
-															bucket === "done" ? "backlog" : "done",
-														)
+														bucket === "done"
+															? onMoveTask(task.id, "backlog")
+															: onRequestAction(task.id, "done", {bucket: "done"})
 													}
 												/>
 											</>
@@ -1997,6 +2166,92 @@ function TaskBucketCard({
 				<Plus className="h-4 w-4" />
 			</button>
 		</section>
+	);
+}
+
+function TaskActionSheet({
+	isSubmitting,
+	kind,
+	locale,
+	onClose,
+	onSubmit,
+}: {
+	isSubmitting: boolean;
+	kind: TaskActionPromptState["kind"];
+	locale: AppLocale;
+	onClose: () => void;
+	onSubmit: (detail: string) => void;
+}) {
+	const t = getDictionary(locale);
+	const [detail, setDetail] = useState("");
+	const label =
+		kind === "done"
+			? t.doneNote
+			: kind === "skip"
+				? t.skipReason
+				: t.pauseReason;
+	const placeholder =
+		kind === "done"
+			? t.doneNotePlaceholder
+			: kind === "skip"
+				? t.skipReasonPlaceholder
+				: t.pauseReasonPlaceholder;
+	const actionLabel =
+		kind === "done"
+			? t.done
+			: kind === "skip"
+				? t.skip
+				: t.pause;
+
+	return (
+		<div
+			className="fixed inset-0 z-20 flex items-end justify-center bg-[rgba(28,40,54,0.28)] px-4 pb-0 pt-10"
+			onClick={onClose}
+		>
+			<div
+				className="w-full max-w-[430px] rounded-t-[2rem] bg-surface px-5 pb-8 pt-5"
+				onClick={(event) => event.stopPropagation()}
+			>
+				<div className="mx-auto h-1.5 w-14 rounded-full bg-border-soft" />
+				<div className="mt-5 flex items-center justify-between">
+					<div>
+						<p className="text-sm font-semibold text-accent-strong">{actionLabel}</p>
+						<h2 className="mt-1 text-xl font-semibold tracking-[-0.04em] text-foreground">
+							{label}
+						</h2>
+					</div>
+					<button
+						className="pressable rounded-xl bg-surface-soft px-3 py-2 text-sm font-semibold text-text-muted disabled:pointer-events-none disabled:opacity-60"
+						disabled={isSubmitting}
+						onClick={onClose}
+						type="button"
+					>
+						{t.close}
+					</button>
+				</div>
+
+				<label className="mt-5 block">
+					<span className="mb-2 block text-sm font-semibold text-foreground">{label}</span>
+					<textarea
+						autoFocus
+						className="min-h-28 w-full resize-none rounded-[1rem] bg-surface-soft px-4 py-4 text-sm text-foreground outline-none transition focus:bg-[#eef4ef]"
+						onChange={(event) => setDetail(event.target.value)}
+						placeholder={placeholder}
+						value={detail}
+					/>
+				</label>
+
+				<button
+					aria-busy={isSubmitting}
+					className="pressable mt-6 flex w-full items-center justify-center rounded-[1rem] bg-accent px-4 py-4 text-base font-semibold text-white disabled:pointer-events-none disabled:opacity-60"
+					disabled={isSubmitting || !detail.trim()}
+					onClick={() => onSubmit(detail.trim())}
+					type="button"
+				>
+					{isSubmitting ? t.submitting : t.save}
+				</button>
+			</div>
+		</div>
 	);
 }
 
@@ -2404,6 +2659,7 @@ function ReviewScreen({
 function SettingsScreen({
 	isAuthRouting,
 	isLocaleSaving,
+	isWeeklyRepeatDaySaving,
 	locale,
 	onAuthRoute,
 	onDefaultBucketChange,
@@ -2411,11 +2667,13 @@ function SettingsScreen({
 	onLocaleChange,
 	onReminderToggle,
 	onTodayLimitChange,
+	onWeeklyRepeatWeekdayChange,
 	preferences,
 	viewer,
 }: {
 	isAuthRouting: boolean;
 	isLocaleSaving: boolean;
+	isWeeklyRepeatDaySaving: boolean;
 	locale: AppLocale;
 	onAuthRoute: () => void;
 	onDefaultBucketChange: (bucket: ComposerState["bucket"]) => void;
@@ -2423,6 +2681,9 @@ function SettingsScreen({
 	onLocaleChange: (locale: AppLocale) => void;
 	onReminderToggle: () => void;
 	onTodayLimitChange: (limit: (typeof TODAY_LIMIT_OPTIONS)[number]) => void;
+	onWeeklyRepeatWeekdayChange: (
+		weekday: WeeklyRepeatWeekday,
+	) => void;
 	preferences: AppPreferences;
 	viewer: DashboardData["viewer"];
 }) {
@@ -2538,6 +2799,36 @@ function SettingsScreen({
 									/>
 								),
 							)}
+						</ChoiceSettingRow>
+					</div>
+					<div className="mx-4 h-px bg-surface-soft" />
+					<div className="px-4 py-3">
+						<ChoiceSettingRow
+							label={t.weeklyDay}
+							description={formatWeekdayLabel(
+								preferences.weeklyRepeatWeekday,
+								locale,
+							)}
+						>
+							{WEEKLY_REPEAT_WEEKDAY_OPTIONS.map((weekday) => (
+								<ChoiceChip
+									key={weekday}
+									active={
+										preferences.weeklyRepeatWeekday ===
+										weekday
+									}
+									disabled={isWeeklyRepeatDaySaving}
+									label={formatWeekdayLabel(
+										weekday,
+										locale,
+									)}
+									onClick={() =>
+										onWeeklyRepeatWeekdayChange(
+											weekday,
+										)
+									}
+								/>
+							))}
 						</ChoiceSettingRow>
 					</div>
 					<div className="mx-4 h-px bg-surface-soft" />

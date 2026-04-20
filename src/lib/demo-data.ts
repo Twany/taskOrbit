@@ -115,7 +115,7 @@ export function getDemoTasks(referenceDate = new Date()): Task[] {
       taskDate: isoDate(referenceDate),
       completedAt: null,
       priority: "medium",
-      repeatType: "weekdays",
+      repeatType: "weekly",
       isSkipped: false,
       createdAt: isoStamp(subDays(referenceDate, 1)),
     },
@@ -165,6 +165,7 @@ export function buildDemoDashboardData(options?: {
     viewer,
     projects: getDemoProjects(),
     tasks: getDemoTasks(),
+    weeklyRepeatWeekday: 5,
     appIssue: null,
     generatedAt: new Date().toISOString(),
   };

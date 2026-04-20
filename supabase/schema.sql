@@ -18,9 +18,13 @@ create table if not exists task_orbit.profiles (
   display_name text,
   avatar_url text,
   locale text not null default 'en',
+  weekly_repeat_weekday smallint not null default 5 check (weekly_repeat_weekday between 0 and 6),
   created_at timestamptz not null default timezone('utc', now()),
   updated_at timestamptz not null default timezone('utc', now())
 );
+
+alter table task_orbit.profiles
+  add column if not exists weekly_repeat_weekday smallint not null default 5;
 
 create table if not exists task_orbit.projects (
   id uuid primary key default gen_random_uuid(),
@@ -41,11 +45,22 @@ create table if not exists task_orbit.task_templates (
   title text not null,
   note text,
   priority text not null default 'medium' check (priority in ('low', 'medium', 'high')),
-  repeat_type text not null check (repeat_type in ('daily', 'weekdays')),
+  repeat_type text not null check (repeat_type in ('daily', 'weekly')),
   active boolean not null default true,
   created_at timestamptz not null default timezone('utc', now()),
   updated_at timestamptz not null default timezone('utc', now())
 );
+
+update task_orbit.task_templates
+set repeat_type = 'weekly'
+where repeat_type = 'weekdays';
+
+alter table task_orbit.task_templates
+  drop constraint if exists task_templates_repeat_type_check;
+
+alter table task_orbit.task_templates
+  add constraint task_templates_repeat_type_check
+  check (repeat_type in ('daily', 'weekly'));
 
 create table if not exists task_orbit.tasks (
   id uuid primary key default gen_random_uuid(),
@@ -70,6 +85,18 @@ alter table task_orbit.tasks
 
 alter table task_orbit.tasks
   add column if not exists is_skipped boolean not null default false;
+
+create table if not exists task_orbit.task_evidence (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references auth.users(id) on delete cascade,
+  task_id uuid not null references task_orbit.tasks(id) on delete cascade,
+  project_id uuid not null references task_orbit.projects(id) on delete cascade,
+  template_id uuid references task_orbit.task_templates(id) on delete set null,
+  action text not null check (action in ('done', 'skip', 'pause')),
+  detail text not null,
+  task_date date,
+  created_at timestamptz not null default timezone('utc', now())
+);
 
 create index if not exists idx_task_orbit_profiles_email
   on task_orbit.profiles(email);
@@ -101,6 +128,12 @@ create index if not exists idx_task_orbit_tasks_template_date
 create unique index if not exists idx_task_orbit_tasks_template_date_unique
   on task_orbit.tasks(template_id, task_date)
   where template_id is not null and task_date is not null;
+
+create index if not exists idx_task_orbit_task_evidence_task_created
+  on task_orbit.task_evidence(task_id, created_at desc);
+
+create index if not exists idx_task_orbit_task_evidence_user_action
+  on task_orbit.task_evidence(user_id, action, created_at desc);
 
 drop trigger if exists profiles_set_updated_at on task_orbit.profiles;
 create trigger profiles_set_updated_at
@@ -234,11 +267,13 @@ grant select, insert, update on task_orbit.profiles to authenticated;
 grant select, insert, update, delete on task_orbit.projects to authenticated;
 grant select, insert, update, delete on task_orbit.task_templates to authenticated;
 grant select, insert, update, delete on task_orbit.tasks to authenticated;
+grant select, insert on task_orbit.task_evidence to authenticated;
 
 alter table task_orbit.profiles enable row level security;
 alter table task_orbit.projects enable row level security;
 alter table task_orbit.task_templates enable row level security;
 alter table task_orbit.tasks enable row level security;
+alter table task_orbit.task_evidence enable row level security;
 
 drop policy if exists "profiles read own" on task_orbit.profiles;
 create policy "profiles read own"
@@ -284,4 +319,18 @@ on task_orbit.tasks
 for all
 to authenticated
 using (auth.uid() = user_id)
+with check (auth.uid() = user_id);
+
+drop policy if exists "task evidence read own" on task_orbit.task_evidence;
+create policy "task evidence read own"
+on task_orbit.task_evidence
+for select
+to authenticated
+using (auth.uid() = user_id);
+
+drop policy if exists "task evidence insert own" on task_orbit.task_evidence;
+create policy "task evidence insert own"
+on task_orbit.task_evidence
+for insert
+to authenticated
 with check (auth.uid() = user_id);

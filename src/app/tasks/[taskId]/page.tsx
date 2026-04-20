@@ -4,12 +4,13 @@ import {
   CalendarDays,
   ChevronLeft,
   CircleCheckBig,
+  Pencil,
   FolderKanban,
   ListTodo,
   TriangleAlert,
 } from "lucide-react";
 
-import { formatLocaleDate, getDictionary } from "@/lib/locale";
+import { formatLocaleDate, formatLocaleDateTime, getDictionary } from "@/lib/locale";
 import { getRequestLocale } from "@/lib/locale.server";
 import { getTaskById } from "@/lib/repository";
 import { getTaskBucket } from "@/lib/task-groups";
@@ -28,7 +29,7 @@ export default async function TaskDetailPage({
     notFound();
   }
 
-  const { task, project } = result;
+  const { task, project, evidence } = result;
   const bucket = getTaskBucket(task);
 
   return (
@@ -39,14 +40,19 @@ export default async function TaskDetailPage({
             <ChevronLeft className="h-5 w-5" />
           </Link>
           <p className="text-sm font-semibold text-foreground">{t.task}</p>
-          <span className="w-9" />
+          <Link
+            className="pressable flex h-9 w-9 items-center justify-center rounded-[0.85rem] text-foreground"
+            href={`/tasks/${task.id}/edit`}
+          >
+            <Pencil className="h-4.5 w-4.5" />
+          </Link>
         </header>
 
         <section className="flex-1 px-5 pb-10 pt-2">
           <h1 className="text-[1.7rem] font-semibold tracking-[-0.05em] text-foreground">
             {task.title}
           </h1>
-          <p className="mt-3 text-sm leading-6 text-text-muted">
+          <p className="mt-3 whitespace-pre-wrap break-words text-sm leading-6 text-text-muted">
             {task.note ?? t.noNote}
           </p>
 
@@ -88,8 +94,8 @@ export default async function TaskDetailPage({
               value={
                 task.repeatType === "daily"
                   ? t.daily
-                  : task.repeatType === "weekdays"
-                    ? t.weekdays
+                  : task.repeatType === "weekly"
+                    ? t.weekly
                     : t.none
               }
             />
@@ -100,6 +106,38 @@ export default async function TaskDetailPage({
             <p className="mt-2 text-sm leading-6 text-text-muted">
               {t.ruleHint}
             </p>
+          </div>
+
+          <div className="mt-7 overflow-hidden rounded-[1rem] bg-surface">
+            <div className="px-4 py-4">
+              <p className="text-sm font-medium text-foreground">{t.detailActivity}</p>
+            </div>
+            {evidence.length === 0 ? (
+              <div className="px-4 pb-4 text-sm text-text-muted">{t.noActivity}</div>
+            ) : (
+              evidence.map((item, index) => (
+                <div key={item.id}>
+                  {index > 0 ? <div className="mx-4 h-px bg-surface-soft" /> : null}
+                  <div className="px-4 py-4">
+                    <div className="flex items-center justify-between gap-4">
+                      <p className="text-sm font-medium text-foreground">
+                        {item.action === "done"
+                          ? t.activityDone
+                          : item.action === "skip"
+                            ? t.activitySkip
+                            : t.activityPause}
+                      </p>
+                      <p className="text-[12px] text-text-muted">
+                        {formatLocaleDateTime(item.createdAt, locale)}
+                      </p>
+                    </div>
+                    <p className="mt-2 whitespace-pre-wrap break-words text-sm leading-6 text-text-muted">
+                      {item.detail}
+                    </p>
+                  </div>
+                </div>
+              ))
+            )}
           </div>
         </section>
       </div>

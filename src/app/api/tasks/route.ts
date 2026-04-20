@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 
 import { hasSupabaseEnv } from "@/lib/supabase/env";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
-import type { RepeatType, Task } from "@/lib/types";
+import type { RepeatType, Task, WeeklyRepeatWeekday } from "@/lib/types";
 
 type TaskInsertRow = {
   id: string;
@@ -19,6 +19,13 @@ type TaskInsertRow = {
   created_at: string;
 };
 
+function getNextWeekdayDate(targetWeekday: WeeklyRepeatWeekday, referenceDate = new Date()) {
+  const nextDate = new Date(referenceDate);
+  const delta = (targetWeekday - referenceDate.getDay() + 7) % 7;
+  nextDate.setDate(referenceDate.getDate() + delta);
+  return nextDate;
+}
+
 export async function POST(request: Request) {
   if (!hasSupabaseEnv()) {
     return NextResponse.json({ error: "Supabase is not configured" }, { status: 400 });
@@ -26,6 +33,7 @@ export async function POST(request: Request) {
 
   const payload = (await request.json()) as {
     title?: string;
+    note?: string;
     projectId?: string;
     bucket?: "backlog" | "today" | "tomorrow";
     priority?: Task["priority"];
@@ -48,12 +56,22 @@ export async function POST(request: Request) {
   const today = new Date();
   const tomorrow = new Date(today);
   tomorrow.setDate(today.getDate() + 1);
-  const todayKey = today.toISOString().slice(0, 10);
   const repeatType = payload.repeatType ?? "none";
   const isRecurring = repeatType !== "none";
+  const { data: profile } = await supabase
+    .from("profiles")
+    .select("weekly_repeat_weekday")
+    .eq("id", user.id)
+    .maybeSingle<{ weekly_repeat_weekday: WeeklyRepeatWeekday }>();
+  const weeklyRepeatWeekday = profile?.weekly_repeat_weekday ?? 5;
+  const recurringDate =
+    repeatType === "weekly"
+      ? getNextWeekdayDate(weeklyRepeatWeekday, today)
+      : today;
+  const recurringDateKey = recurringDate.toISOString().slice(0, 10);
   const plannedDate =
     isRecurring
-      ? todayKey
+      ? recurringDateKey
       : payload.bucket === "today"
       ? today.toISOString().slice(0, 10)
       : payload.bucket === "tomorrow"
@@ -68,6 +86,7 @@ export async function POST(request: Request) {
         user_id: user.id,
         project_id: payload.projectId,
         title: payload.title.trim(),
+        note: payload.note?.trim() || null,
         priority: payload.priority ?? "medium",
         repeat_type: repeatType,
         active: true,
@@ -91,13 +110,14 @@ export async function POST(request: Request) {
         user_id: user.id,
         project_id: payload.projectId,
         template_id: templateId,
-      title: payload.title.trim(),
+        title: payload.title.trim(),
+        note: payload.note?.trim() || null,
         priority: payload.priority ?? "medium",
-      state: "active",
-      planned_date: plannedDate,
-      task_date: isRecurring ? todayKey : plannedDate,
-      is_skipped: false,
-    })
+        state: "active",
+        planned_date: plannedDate,
+        task_date: isRecurring ? recurringDateKey : plannedDate,
+        is_skipped: false,
+      })
     .select("id,project_id,template_id,title,note,state,planned_date,task_date,completed_at,priority,is_skipped,created_at")
     .single<TaskInsertRow>();
 

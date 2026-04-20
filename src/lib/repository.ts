@@ -1,6 +1,13 @@
 import "server-only";
 
-import type { DashboardData, Project, RepeatType, Task } from "./types";
+import type {
+	DashboardData,
+	Project,
+	RepeatType,
+	Task,
+	TaskEvidence,
+	WeeklyRepeatWeekday,
+} from "./types";
 import { hasSupabaseEnv } from "./supabase/env";
 import { createSupabaseServerClient } from "./supabase/server";
 
@@ -23,6 +30,10 @@ type TaskTemplateRow = {
 	active: boolean;
 };
 
+type ProfileRow = {
+	weekly_repeat_weekday: WeeklyRepeatWeekday;
+};
+
 type TaskRow = {
 	id: string;
 	project_id: string;
@@ -35,6 +46,13 @@ type TaskRow = {
 	completed_at: string | null;
 	priority: Task["priority"];
 	is_skipped: boolean;
+	created_at: string;
+};
+
+type TaskEvidenceRow = {
+	id: string;
+	action: TaskEvidence["action"];
+	detail: string;
 	created_at: string;
 };
 
@@ -67,21 +85,31 @@ function mapTask(row: TaskRow, repeatType: RepeatType | null): Task {
 	};
 }
 
+function mapTaskEvidence(row: TaskEvidenceRow): TaskEvidence {
+	return {
+		id: row.id,
+		action: row.action,
+		detail: row.detail,
+		createdAt: row.created_at,
+	};
+}
+
 function shouldGenerateTemplateForDate(
 	template: TaskTemplateRow,
 	referenceDate: Date,
+	weeklyRepeatWeekday: WeeklyRepeatWeekday,
 ) {
 	if (template.repeat_type === "daily") {
 		return true;
 	}
 
-	const day = referenceDate.getDay();
-	return day !== 0 && day !== 6;
+	return referenceDate.getDay() === weeklyRepeatWeekday;
 }
 
 async function ensureTodayRecurringTasks(
 	userId: string,
 	templates: TaskTemplateRow[],
+	weeklyRepeatWeekday: WeeklyRepeatWeekday,
 ) {
 	if (templates.length === 0) {
 		return;
@@ -92,7 +120,12 @@ async function ensureTodayRecurringTasks(
 	const todayKey = today.toISOString().slice(0, 10);
 	const activeTemplates = templates.filter(
 		(template) =>
-			template.active && shouldGenerateTemplateForDate(template, today),
+			template.active &&
+			shouldGenerateTemplateForDate(
+				template,
+				today,
+				weeklyRepeatWeekday,
+			),
 	);
 
 	if (activeTemplates.length === 0) {
@@ -156,6 +189,7 @@ export async function getDashboardData(): Promise<DashboardData> {
 			},
 			projects: [],
 			tasks: [],
+			weeklyRepeatWeekday: 5,
 			appIssue: "config-missing",
 			generatedAt: new Date().toISOString(),
 		};
@@ -174,21 +208,38 @@ export async function getDashboardData(): Promise<DashboardData> {
 			},
 			projects: [],
 			tasks: [],
+			weeklyRepeatWeekday: 5,
 			appIssue: null,
 			generatedAt: new Date().toISOString(),
 		};
 	}
 
-	const { data: templateRows, error: templatesError } = await supabase
+	const [{ data: profileRow }, { data: templateRows, error: templatesError }] =
+		await Promise.all([
+			supabase
+				.from("profiles")
+				.select("weekly_repeat_weekday")
+				.eq("id", user.id)
+				.maybeSingle<ProfileRow>(),
+			supabase
 		.from("task_templates")
 		.select("id,project_id,title,note,priority,repeat_type,active")
-		.eq("user_id", user.id);
+		.eq("user_id", user.id),
+		]);
+
+	const weeklyRepeatWeekday =
+		profileRow?.weekly_repeat_weekday ?? 5;
 
 	if (!templatesError) {
-		await ensureTodayRecurringTasks(user.id, templateRows ?? []);
+		await ensureTodayRecurringTasks(
+			user.id,
+			templateRows ?? [],
+			weeklyRepeatWeekday,
+		);
 	}
 
-	const [projectsResult, tasksResult, allTemplatesResult] = await Promise.all([
+	const [projectsResult, tasksResult, allTemplatesResult, profileResult] =
+		await Promise.all([
 		supabase
 			.from("projects")
 			.select("id,name,color,icon,status,sort_order")
@@ -206,7 +257,12 @@ export async function getDashboardData(): Promise<DashboardData> {
 			.from("task_templates")
 			.select("id,repeat_type,active")
 			.eq("user_id", user.id),
-	]);
+		supabase
+			.from("profiles")
+			.select("weekly_repeat_weekday")
+			.eq("id", user.id)
+			.maybeSingle<ProfileRow>(),
+		]);
 
 	if (
 		projectsResult.error ||
@@ -221,6 +277,7 @@ export async function getDashboardData(): Promise<DashboardData> {
 				},
 				projects: [],
 				tasks: [],
+				weeklyRepeatWeekday,
 				appIssue: "load-failed",
 			generatedAt: new Date().toISOString(),
 		};
@@ -243,6 +300,8 @@ export async function getDashboardData(): Promise<DashboardData> {
 		tasks: (tasksResult.data ?? []).map((task) =>
 			mapTask(task, task.template_id ? repeatByTemplateId.get(task.template_id) ?? null : null),
 		),
+		weeklyRepeatWeekday:
+			profileResult.data?.weekly_repeat_weekday ?? weeklyRepeatWeekday,
 		appIssue: null,
 		generatedAt: new Date().toISOString(),
 	};
@@ -257,6 +316,26 @@ export async function getTaskById(taskId: string) {
 	}
 
 	const project = dashboard.projects.find((item) => item.id === task.projectId) ?? null;
+	let evidence: TaskEvidence[] = [];
 
-	return { dashboard, task, project };
+	if (hasSupabaseEnv()) {
+		const supabase = await createSupabaseServerClient();
+		const {
+			data: { user },
+		} = await supabase.auth.getUser();
+
+		if (user) {
+			const { data } = await supabase
+				.from("task_evidence")
+				.select("id,action,detail,created_at")
+				.eq("task_id", taskId)
+				.eq("user_id", user.id)
+				.order("created_at", { ascending: false })
+				.limit(8);
+
+			evidence = (data ?? []).map(mapTaskEvidence);
+		}
+	}
+
+	return { dashboard, task, project, evidence };
 }
